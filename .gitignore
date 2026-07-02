@@ -1,14 +1,13 @@
-# build outputs
+# build outputs (libfluke.a/.so + objects live here)
 lib/
-*.o
-*.a
 *.d
-
-# AOT export artifacts (top-level, regenerate via the export scripts)
-artifacts/
 
 # python
 __pycache__/
 *.pyc
 pyvenv/
 .venv/
+
+# NOTE: artifacts/<arch>/*.{h,o} (AOT-exported fused kernels) ARE committed — they are
+# bundled into libfluke.a and consumed by downstream (slorado). Regenerate via the
+# cute/**/export_*.py scripts. Do not add a blanket *.o ignore; it would drop them.
