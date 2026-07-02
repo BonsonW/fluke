@@ -1,0 +1,14 @@
+# build outputs
+lib/
+*.o
+*.a
+*.d
+
+# AOT export artifacts (top-level, regenerate via the export scripts)
+artifacts/
+
+# python
+__pycache__/
+*.pyc
+pyvenv/
+.venv/
