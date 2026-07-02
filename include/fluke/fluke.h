@@ -38,7 +38,50 @@ void fluke_rotary_emb_cpu(
     int n_threads
 );
 
+// RMSNorm over a residual add: out = rmsnorm(in + alpha*residual) * weight, where
+// rmsnorm(v) = v / sqrt(mean(v^2) + eps), computed per row (token). in/residual are
+// [n_tokens, hidden_dim], weight is [hidden_dim]. fp32 math. (CPU reference for the
+// non-quant kernel; the quantizing variant is GPU-only.)
+void fluke_rmsnorm_cpu(
+    void *in,
+    const void *residual,
+    const void *weight,
+    void *out,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps,
+    int n_threads
+);
+
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+
+// out = rmsnorm(in + alpha*residual) * weight. in/residual/weight/out are fp16
+// ([n_tokens, hidden_dim]; weight [hidden_dim]); fp32 math. hidden_dim even, <= 1024.
+void fluke_rmsnorm_gpu(
+    const void* in,
+    const void* residual,
+    const void* weight,
+    void* out,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
+
+// Fused RMSNorm + per-token INT8 quantize, in place. `residual` (int8) and
+// `residual_scale` (f32, per-token) hold the previous quantized residual on entry;
+// on return they hold the newly quantized rmsnorm(in + alpha*dequant(residual))*weight.
+void fluke_rmsnorm_quant_int8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
 
 // See fluke_rotary_emb_cpu: sin_gpu/cos_gpu are [seq_len, sincos_width] (rotate-half),
 // rotating 2*sincos_width dims per head (require 2*sincos_width <= head_dim).

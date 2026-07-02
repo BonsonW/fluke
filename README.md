@@ -65,6 +65,12 @@ pure CUDA C epilogue `fluke_silu_mul_gpu` (`src/nn_cuda.c`), tested by
 `cute/test_dual_gemm_silu.py` (`out = silu(A@Bg^T) * (A@Bu^T)`; jit/aot vs torch and/or
 the pure CUDA C `silu_mul`).
 
+**RMSNorm** is pure C/CUDA only (no CuTe DSL): `fluke_rmsnorm_gpu` and the fused
+`fluke_rmsnorm_quant_int8_gpu` in `src/` (CUDA + HIP), with a fp32 CPU reference
+`fluke_rmsnorm_cpu` for the non-quant kernel only. Tested by `test/test_rmsnorm_cuda.py`
+(CUDA kernels vs a naive torch reference; `load_inline`). The fp8 quant variant is not
+ported — openfish leaves it unimplemented on CUDA.
+
 ## Build
 
 ```
@@ -76,7 +82,8 @@ make                                                          # CPU-only
 ## Test
 
 ```
-<venv>/bin/python test/test_rotary_cuda.py                    # pure CUDA vs torch ref
+<venv>/bin/python test/test_rotary_cuda.py                    # pure CUDA rotary vs torch ref
+<venv>/bin/python test/test_rmsnorm_cuda.py                   # pure CUDA rmsnorm (+quant int8) vs torch
 <venv>/bin/python cute/test_rotary.py                         # DSL jit vs torch + pure CUDA
 <venv>/bin/python cute/test_rotary.py --impl aot              # exported .o (load_module) instead
 <venv>/bin/python cute/test_rotary.py --impl aot --ref torch  # pick impl + reference

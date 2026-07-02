@@ -59,3 +59,51 @@ void fluke_silu_mul_gpu(
     cudaDeviceSynchronize();
     checkCudaError();
 }
+
+void fluke_rmsnorm_gpu(
+    const void* in,
+    const void* residual,
+    const void* weight,
+    void* out,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+) {
+    ASSERT(hidden_dim <= 1024);
+    ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
+
+    int threads = hidden_dim / 2;
+    int blocks = n_tokens;
+
+    rmsnorm<<<blocks, threads>>>(
+        (half *)in, (half *)residual, (half *)weight, (half *)out, n_tokens, hidden_dim, alpha, eps
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}
+
+void fluke_rmsnorm_quant_int8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+) {
+    ASSERT(hidden_dim <= 1024);
+    ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
+
+    int threads = hidden_dim / 2;
+    int blocks = n_tokens;
+
+    rmsnorm_quant_int8<<<blocks, threads>>>(
+        (half *)in, (half *)weight, (int8_t *)residual, (float *)residual_scale, n_tokens, hidden_dim, alpha, eps
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}

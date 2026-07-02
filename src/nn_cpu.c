@@ -129,3 +129,80 @@ void fluke_rotary_emb_cpu(
         NEG_CHK(ret);
     }
 }
+
+// ── RMSNorm (fp32 CPU reference) ──────────────────────────────────────────────
+typedef struct {
+    float *in;
+    const float *residual;
+    const float *weight;
+    float *out;
+    uint64_t start;
+    uint64_t end;
+    int hidden_dim;
+    float alpha;
+    float eps;
+} rmsnorm_thread_arg_t;
+
+static void* pthread_single_rmsnorm(void* voidargs) {
+    rmsnorm_thread_arg_t* a = (rmsnorm_thread_arg_t*)voidargs;
+    for (uint64_t row = a->start; row < a->end; ++row) {
+        const float *in = a->in + row * a->hidden_dim;
+        const float *res = a->residual + row * a->hidden_dim;
+        float *out = a->out + row * a->hidden_dim;
+
+        float sum_sq = 0.0f;
+        for (int j = 0; j < a->hidden_dim; ++j) {
+            float v = in[j] + a->alpha * res[j];
+            sum_sq += v * v;
+        }
+        float rms_inv = 1.0f / sqrtf(sum_sq / a->hidden_dim + a->eps);
+        for (int j = 0; j < a->hidden_dim; ++j) {
+            float v = in[j] + a->alpha * res[j];
+            out[j] = v * rms_inv * a->weight[j];
+        }
+    }
+    pthread_exit(0);
+}
+
+void fluke_rmsnorm_cpu(
+    void *in,
+    const void *residual,
+    const void *weight,
+    void *out,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps,
+    int n_threads
+) {
+    n_threads = n_tokens < n_threads ? n_tokens : n_threads;
+    if (n_threads < 1) n_threads = 1;
+    const int chunks_per_thread = n_tokens / n_threads;
+    const int num_threads_with_one_more_chunk = n_tokens % n_threads;
+
+    pthread_t tids[n_threads];
+    rmsnorm_thread_arg_t pt_args[n_threads];
+    int32_t t, ret;
+
+    for (t = 0; t < n_threads; t++) {
+        int extra = t < num_threads_with_one_more_chunk ? t : num_threads_with_one_more_chunk;
+        pt_args[t].start = t * chunks_per_thread + extra;
+        pt_args[t].end = pt_args[t].start + chunks_per_thread + (int)(t < num_threads_with_one_more_chunk);
+        pt_args[t].in = (float *)in;
+        pt_args[t].residual = (const float *)residual;
+        pt_args[t].weight = (const float *)weight;
+        pt_args[t].out = (float *)out;
+        pt_args[t].hidden_dim = hidden_dim;
+        pt_args[t].alpha = alpha;
+        pt_args[t].eps = eps;
+    }
+
+    for (t = 0; t < n_threads; t++) {
+        ret = pthread_create(&tids[t], NULL, pthread_single_rmsnorm, (void *)(&pt_args[t]));
+        NEG_CHK(ret);
+    }
+    for (t = 0; t < n_threads; t++) {
+        ret = pthread_join(tids[t], NULL);
+        NEG_CHK(ret);
+    }
+}
