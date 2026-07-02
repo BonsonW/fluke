@@ -8,6 +8,10 @@ __pycache__/
 pyvenv/
 .venv/
 
-# NOTE: artifacts/<arch>/*.{h,o} (AOT-exported fused kernels) ARE committed — they are
-# bundled into libfluke.a and consumed by downstream (slorado). Regenerate via the
-# cute/**/export_*.py scripts. Do not add a blanket *.o ignore; it would drop them.
+# AOT-exported fused-kernel artifacts are build outputs, NOT committed. Regenerate per arch
+# before `make cuda=1` / `make rocm=1`:
+#   CUDA (sm80):     cute/**/export_*.py           -> artifacts/sm80/*.{h,o}
+#   RDNA4 (gfx12xx): fly/rdna4/**/export_*.py      -> artifacts/<gfxNNNN>/*.{h,hsaco}
+# They are bundled into libfluke.a at build time (objcopy-embedded for HIP; symbol-rewritten
+# .o for CUDA). The Makefile fails with a clear message if an expected artifact is missing.
+artifacts/

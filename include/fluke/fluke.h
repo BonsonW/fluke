@@ -173,6 +173,45 @@ int fluke_gated_mlp_i8_gpu(
     int M
 );
 
+// ── Fused FP8 DSL kernels (AOT-exported FlyDSL/RDNA artifacts) ────────────────
+// The AMD/RDNA counterpart of the int8 ABI above. Same fused ops, but inputs are
+// fp8 (e4m3) with the fp8 amax/448 scale convention instead of int8 amax/127, run on
+// RDNA4 WMMA (f32 accumulate). Weights are PRESHUFFLED to the WMMA B layout
+// [N/16, K/16, 2, 16, 8] (see fly.rdna4 preshuffle_b_fp8). Implemented in
+// src/fused_hip.cpp over the per-arch HSACO artifacts embedded into libfluke.a; the
+// arch detection + module load live inside fluke. Only available on a supported RDNA4
+// device (gfx1200/gfx1201) with matching precompiled kernels — otherwise
+// fluke_fp8_select returns NULL and the caller keeps its fp16 path.
+
+// Opaque, process-lifetime backend handle. Loads the device arch's kernel module(s)
+// once (selected from the embedded per-arch HSACOs by gcnArchName). Returns NULL if no
+// precompiled backend matches this device's arch and `dims`. Do NOT free.
+typedef struct fluke_fp8_backend fluke_fp8_backend_t;
+fluke_fp8_backend_t *fluke_fp8_select(int device_index, fluke_dims_t dims);
+
+// Fused fp8 wqkv GEMM + rotary. a_fp8: [M, d_model] fp8 (+per-token scale_a). wqkv_fp8:
+// PRESHUFFLED [3*d_model/16, d_model/16, 2, 16, 8] fp8 (+per-out-channel scale_b [3*d_model]).
+// sin/cos: fp32 [seqlen, rotary_dim/2] (rotate-half). out: fp16 [M, 3*d_model] (row-major,
+// contiguous). seqlen = tokens/seq (rotary indexes seq = row % seqlen). Returns 0 on success.
+int fluke_qkv_rotary_fp8_gpu(
+    const fluke_fp8_backend_t *b, void *out,
+    const void *a_fp8, const void *wqkv_fp8,
+    const void *scale_a, const void *scale_b,
+    const void *sin, const void *cos,
+    int M, int seqlen
+);
+
+// Fused fp8 dual GEMM (gate, up) + SiLU. a_fp8: [M, d_model] fp8 (+per-token scale_a).
+// gate_fp8/up_fp8: PRESHUFFLED [dim_feedforward/16, d_model/16, 2, 16, 8] fp8 (+per-out-channel
+// scales [dim_feedforward]). out: fp16 [M, dim_feedforward] = silu(gate) * up (row-major,
+// contiguous). Returns 0 on success.
+int fluke_gated_mlp_fp8_gpu(
+    const fluke_fp8_backend_t *b, void *out,
+    const void *a_fp8, const void *gate_fp8, const void *up_fp8,
+    const void *scale_a, const void *scale_gate, const void *scale_up,
+    int M
+);
+
 #endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 #ifdef __cplusplus

@@ -27,12 +27,19 @@ _SIGNATURES = {
 
 
 def _build():
-    """Build lib/libfluke.so for the current GPU (make shared cuda=1 CUDA_ARCH=...)."""
+    """Build lib/libfluke.so for the current GPU. Picks the ROCm (HIP) or CUDA backend from the
+    torch build: ROCm torch presents as torch.cuda.* but sets torch.version.hip."""
     import torch
-    cc = torch.cuda.get_device_capability()
-    arch = f"-gencode arch=compute_{cc[0]}{cc[1]},code=sm_{cc[0]}{cc[1]}"
-    print(f">> building libfluke.so (make shared, {arch})")
-    subprocess.run(["make", "shared", "cuda=1", f"CUDA_ARCH={arch}"], cwd=_ROOT, check=True)
+    if getattr(torch.version, "hip", None):
+        gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]  # e.g. gfx1201
+        print(f">> building libfluke.so (make shared rocm=1, --offload-arch={gfx})")
+        subprocess.run(["make", "shared", "rocm=1", f"ROCM_ARCH=--offload-arch={gfx}"],
+                       cwd=_ROOT, check=True)
+    else:
+        cc = torch.cuda.get_device_capability()
+        arch = f"-gencode arch=compute_{cc[0]}{cc[1]},code=sm_{cc[0]}{cc[1]}"
+        print(f">> building libfluke.so (make shared cuda=1, {arch})")
+        subprocess.run(["make", "shared", "cuda=1", f"CUDA_ARCH={arch}"], cwd=_ROOT, check=True)
 
 
 def load(rebuild=False):

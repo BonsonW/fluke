@@ -23,6 +23,12 @@ FUSED_OBJ =
 AOT_OBJ =
 SHARED_LINK = $(CC) -shared
 
+# fused_hip.o = HIP host dispatch for the fp8 ABI. Built with hipcc on a rocm build (real
+# backend), else with the host C++ compiler (compiles to the null-backend stub). Overridden
+# in the rocm branch below.
+FUSED_HIP_CC = $(CXX)
+FUSED_HIP_CFLAGS = $(CXXFLAGS) $(CPPFLAGS) -I .
+
 # make asan=1 enables address sanitiser
 ifdef asan
 	CFLAGS += -fsanitize=address -fno-omit-frame-pointer
@@ -45,7 +51,8 @@ ifdef cuda
     CPPFLAGS += -DHAVE_CUDA=1 -I $(CUDA_INC)
     # Fused DSL kernels use the CUDA 12 library API; only bundle the AOT objects on CUDA >= 12.
     # fused_cuda.o is always built (null-backend stub on older CUDA), so downstream still links.
-    FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o
+    # fused_hip.o compiles to the fp8 null-backend stub here (HAVE_ROCM undefined).
+    FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o $(BUILD_DIR)/fused_hip.o
     CUDART_VER := $(shell grep -E 'define +CUDART_VERSION' $(CUDA_INC)/cuda_runtime_api.h 2>/dev/null | grep -oE '[0-9]+' | head -1)
     ifeq ($(shell [ "$(CUDART_VER)" -ge 12000 ] 2>/dev/null && echo 1),1)
         AOT_OBJ = $(BUILD_DIR)/gemm_i8_rotary_N1536_K512_H8D64R64S2048.o \
@@ -64,8 +71,17 @@ else ifdef rocm
 	SHARED_LINK = $(HIPCC) -shared $(ROCM_ARCH)
 	ROCM_LDFLAGS = -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
 	CPPFLAGS += -DHAVE_ROCM=1
-	# No fused (fly) AOT kernels for AMD yet; fused_cuda.o compiles to null-backend stubs.
-	FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o
+	# fp8 fused dispatch (fused_hip.o, real backend) + fused_cuda.o (int8 null stub here).
+	FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o $(BUILD_DIR)/fused_hip.o
+	FUSED_HIP_CC = $(HIPCC)
+	FUSED_HIP_CFLAGS = $(ROCM_CFLAGS) $(CPPFLAGS) -I . -fPIC
+	# AOT fp8 kernels: one HSACO per concrete RDNA4 arch (gfx12-generic won't compile through
+	# FlyDSL's MLIR and per-chip objects don't cross-load), embedded into libfluke.a and loaded
+	# by gcnArchName in fused_hip.cpp. Baked shapes match the CUDA int8 kernels.
+	ROTARY_HSACO = rdna_fp8_gemm_rotary_N1536_K512_TM64_TN256.hsaco
+	MLP_HSACO    = rdna_fp8_dual_gemm_silu_N2048_K512_TM32_TN256.hsaco
+	AOT_OBJ = $(BUILD_DIR)/embed_rotary_gfx1200.o $(BUILD_DIR)/embed_rotary_gfx1201.o \
+	          $(BUILD_DIR)/embed_mlp_gfx1200.o    $(BUILD_DIR)/embed_mlp_gfx1201.o
 else
 	GPU_LIB = $(BUILD_DIR)/cpu_decoy.a
 endif
@@ -75,10 +91,18 @@ ifdef debug
 	CFLAGS += -fopenmp
 endif
 
-.PHONY: all shared clean distclean
+.PHONY: all shared fp8_shared clean distclean
 
 all: $(STATICLIB)
 shared: $(SHAREDLIB)
+
+# fp8 fused ABI as a standalone .so for the ctypes-based fly/ tests (rocm=1 only). Bundles the
+# fp8 dispatch + the embedded per-arch HSACOs; loaded by fly/test_*.py to exercise the real
+# C ABI (fluke_fp8_select / fluke_qkv_rotary_fp8_gpu / fluke_gated_mlp_fp8_gpu) on device ptrs.
+FP8_SHAREDLIB = $(BUILD_DIR)/libfluke_fp8.so
+fp8_shared: $(FP8_SHAREDLIB)
+$(FP8_SHAREDLIB): $(BUILD_DIR)/fused_hip.o $(AOT_OBJ)
+	$(HIPCC) -shared -fPIC $^ $(ROCM_LDFLAGS) -o $@
 
 # Static lib bundles the CPU/GPU nn kernels + the fused-int8 dispatch + the AOT kernel
 # objects (symbol-rewritten below). This is what slorado links (like libopenfish.a).
@@ -104,6 +128,11 @@ $(BUILD_DIR)/nn_cpu.o: src/nn_cpu.c | $(BUILD_DIR)
 # `#include "artifacts/sm80/..."` resolve. Self-guards on CUDART>=12 (else null-backend stub).
 $(BUILD_DIR)/fused_cuda.o: src/fused_cuda.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -I . $(DEPFLAGS) -c $< -o $@
+
+# Fused-fp8 dispatch (host HIP; includes artifacts/<gfxNNNN>/*.h). Built with hipcc on rocm
+# (real backend) or the host C++ compiler elsewhere (fp8 null-backend stub; HAVE_ROCM undefined).
+$(BUILD_DIR)/fused_hip.o: src/fused_hip.cpp | $(BUILD_DIR)
+	$(FUSED_HIP_CC) $(FUSED_HIP_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -140,6 +169,20 @@ $(BUILD_DIR)/hip_code.a: $(ROCM_OBJ)
 
 $(BUILD_DIR)/nn_hip.o: src/nn_hip.c | $(BUILD_DIR)
 	$(HIPCC) -x hip $(ROCM_CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -fPIC -c $< -o $@
+
+# Embed a per-arch HSACO image into an object exposing arch-qualified symbols
+# fluke_fp8_<role>_<gfxNNNN>{,_end} (fused_hip.cpp loads them via hipModuleLoadData). Symbols are
+# arch-qualified so gfx1200/gfx1201 images don't collide at link. Self-contained: no runtime file.
+# The stem (%) is the gfx arch. Fails with a clear message if the artifact wasn't exported yet.
+$(BUILD_DIR)/embed_rotary_%.o: artifacts/%/$(ROTARY_HSACO) | $(BUILD_DIR)
+	@test -f $< || { echo "[fluke] missing $< — run fly/rdna4/rotary/export_fp8_gemm_rotary.py first"; exit 1; }
+	printf '.section .rodata\n.global fluke_fp8_rotary_%s\nfluke_fp8_rotary_%s:\n.incbin "%s"\n.global fluke_fp8_rotary_%s_end\nfluke_fp8_rotary_%s_end:\n' $* $* '$(abspath $<)' $* $* > $(BUILD_DIR)/embed_rotary_$*.s
+	$(CC) -c $(BUILD_DIR)/embed_rotary_$*.s -o $@
+
+$(BUILD_DIR)/embed_mlp_%.o: artifacts/%/$(MLP_HSACO) | $(BUILD_DIR)
+	@test -f $< || { echo "[fluke] missing $< — run fly/rdna4/dual_gemm_silu/export_fp8_dual_gemm_silu.py first"; exit 1; }
+	printf '.section .rodata\n.global fluke_fp8_mlp_%s\nfluke_fp8_mlp_%s:\n.incbin "%s"\n.global fluke_fp8_mlp_%s_end\nfluke_fp8_mlp_%s_end:\n' $* $* '$(abspath $<)' $* $* > $(BUILD_DIR)/embed_mlp_$*.s
+	$(CC) -c $(BUILD_DIR)/embed_mlp_$*.s -o $@
 
 # pull in auto-generated header dependencies (.d files emitted by -MMD)
 -include $(BUILD_DIR)/*.d

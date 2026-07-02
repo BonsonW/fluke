@@ -24,12 +24,9 @@
 #include "artifacts/sm80/gemm_i8_rotary_N1536_K512_H8D64R64S2048.h"
 #include "artifacts/sm80/gemm_i8_dual_silu_N2048_K512.h"
 
-// Baked kernel dims (specialized into the cubin symbols). fluke_int8_select verifies the
-// requested dims against these and bows out (NULL) on mismatch.
-#define FLUKE_SM80_D_MODEL      512
-#define FLUKE_SM80_DIM_FF       2048
-#define FLUKE_SM80_NHEAD        8
-#define FLUKE_SM80_HEAD_DIM     64
+// Baked kernel dims (shared with the HIP backend — model-specific, not arch-specific).
+// fluke_int8_select verifies the requested dims against these and bows out (NULL) on mismatch.
+#include "fused_dims.h"
 
 struct fluke_int8_backend {
     fluke_dims_t dims;
@@ -61,11 +58,11 @@ fluke_int8_backend_t *fluke_int8_select(int device_index, fluke_dims_t dims) {
         fprintf(stderr, "[fluke] no int8 backend for compute capability %d.%d — using fp16\n", major, minor);
         return NULL;
     }
-    if (dims.d_model != FLUKE_SM80_D_MODEL || dims.dim_feedforward != FLUKE_SM80_DIM_FF ||
-        dims.nhead != FLUKE_SM80_NHEAD || dims.head_dim != FLUKE_SM80_HEAD_DIM) {
+    if (dims.d_model != FLUKE_SUP_D_MODEL || dims.dim_feedforward != FLUKE_SUP_DIM_FF ||
+        dims.nhead != FLUKE_SUP_NHEAD || dims.head_dim != FLUKE_SUP_HEAD_DIM) {
         fprintf(stderr, "[fluke] model dims do not match precompiled kernels "
                         "(need d_model=%d, dim_feedforward=%d, nhead=%d, head_dim=%d) — using fp16\n",
-                FLUKE_SM80_D_MODEL, FLUKE_SM80_DIM_FF, FLUKE_SM80_NHEAD, FLUKE_SM80_HEAD_DIM);
+                FLUKE_SUP_D_MODEL, FLUKE_SUP_DIM_FF, FLUKE_SUP_NHEAD, FLUKE_SUP_HEAD_DIM);
         return NULL;
     }
 

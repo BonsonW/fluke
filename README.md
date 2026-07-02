@@ -18,16 +18,27 @@ Two parts:
 ## Layout
 
 ```
-include/fluke/fluke.h            public C API (fluke_rotary_emb_cpu/gpu, ...)
-src/                             pure CPU/CUDA/HIP C kernels (flat cuda/hip split)
-test/                            python tests for the pure C library (load_inline)
-artifacts/                       AOT-exported .h/.o (top-level, shared; gitignored)
-cute/common.py                   shared test helpers (arch dispatch, quantize, report)
-cute/test_<op>.py                per-op test: picks an impl + reference, compares
+include/fluke/fluke.h            public C API (fluke_rotary_emb_cpu/gpu, fluke_*_i8/fp8_gpu, ...)
+src/                             pure CPU/CUDA/HIP C kernels (flat cuda/hip split) + fused_{cuda,hip}.cpp
+test/                            python tests for the pure C library
+artifacts/<arch>/                AOT-exported kernels (gitignored, regenerate per arch — see below):
+                                   sm80/      CUDA int8:  *.h + *.o     (CuTe)
+                                   gfx1200/   RDNA4 fp8:  *.h + *.hsaco (FlyDSL)
+                                   gfx1201/   RDNA4 fp8:  *.h + *.hsaco (FlyDSL)
+cute/common.py                   CUDA test helpers (arch dispatch, quantize, report)
+cute/test_<op>.py                per-op CUDA test: picks an impl + reference, compares
 cute/<arch>/gemm/                the INT8 (gemm_i8_quant) + f16 (gemm_f16) GEMM bases, shared by all ops
-cute/<arch>/<op>/                per-op implementation: DSL kernel + export script
-fly/<arch>/                      FlyDSL kernels per microarch (rdna4, cdna3, ...); stub
+cute/<arch>/<op>/                per-op CUDA implementation: CuTe kernel + export script
+fly/common.py                    FlyDSL test helpers (gfx arch dispatch; fp8 C-ABI ctypes loader)
+fly/test_<op>.py                 per-op HIP test: --impl abi (real C ABI) | jit (in-process)
+fly/rdna4/<op>/                  per-op RDNA4 fp8 implementation: FlyDSL kernel + export script
+fly/rdna4/_fp8_export.py         shared export machinery (per-arch loop, HSACO extract, embed loader)
 ```
+
+The CUDA (`cute/`) and HIP (`fly/`) DSL trees mirror each other. The AMD side mirrors
+`cute/ampere/`: `fly/rdna4/{rotary,dual_gemm_silu,quantize,gemm}/`. Both fuse the same ops but
+RDNA4 uses **fp8** (e4m3, WMMA, f32-accumulate, amax/448 scale) where Ampere uses **int8**
+(amax/127). RDNA4 weights are preshuffled to the WMMA B layout `[N/16,K/16,2,16,8]`.
 
 ## Test organization
 
@@ -90,14 +101,34 @@ ported — openfish leaves it unimplemented on CUDA.
 
 ## Build
 
+AOT artifacts are **not committed** — regenerate them for the target arch *before* `make`
+(the build embeds/links them into `libfluke.a` and fails with a clear message if missing):
+
+```
+# CUDA (sm80): export the CuTe int8 artifacts -> artifacts/sm80/
+<venv>/bin/python cute/ampere/rotary/export_gemm_i8_rotary.py
+<venv>/bin/python cute/ampere/dual_gemm_silu/export_dual_gemm_i8_silu.py
+
+# RDNA4 (gfx1200+gfx1201): export the FlyDSL fp8 artifacts -> artifacts/<gfxNNNN>/
+<venv>/bin/python fly/rdna4/rotary/export_fp8_gemm_rotary.py
+<venv>/bin/python fly/rdna4/dual_gemm_silu/export_fp8_dual_gemm_silu.py    # dual-silu + per-token quantize
+<venv>/bin/python fly/rdna4/factored_lstm/export_fp8_factored_lstm.py     # fused step + fp8 down-proj
+```
+
 ```
 make cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80"          # -> lib/libfluke.a
 make shared cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80"   # -> lib/libfluke.so (PIC, for tests)
-make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"                       # HIP backend
+make rocm=1 ROCM_ARCH="--offload-arch=gfx1201"                       # HIP backend (embeds fp8 HSACOs)
+make fp8_shared rocm=1 ROCM_ARCH="--offload-arch=gfx1201"            # -> lib/libfluke_fp8.so (for fly tests)
 make                                                                 # CPU-only
 ```
 
-(The Python tests build `lib/libfluke.so` automatically via `fluke_lib` if it's missing.)
+The RDNA4 fp8 fused kernels are compiled once per concrete arch (gfx1200, gfx1201) — a single
+`gfx12-generic` object won't compile through FlyDSL's MLIR and per-chip objects don't cross-load,
+so `fluke_fp8_select` picks the matching embedded HSACO by the device's `gcnArchName`.
+
+(The Python tests build the needed `.so` automatically via `fluke_lib` / `fly.common` if missing;
+`fluke_lib` auto-detects CUDA vs ROCm from the torch build.)
 
 ## Test
 
@@ -112,6 +143,12 @@ make                                                                 # CPU-only
 <venv>/bin/python cute/test_factored_lstm.py                 # factored-LSTM step: jit/aot vs torch
 <venv>/bin/python cute/ampere/rotary/export_gemm_i8_rotary.py # AOT export only (config inlined)
 <venv>/bin/python cute/ampere/factored_lstm/export_factored_lstm_i8.py # AOT export (step + int8 down-proj)
+
+# RDNA4 fp8 (HIP) — --impl abi exercises the real fluke_fp8_* C ABI (embedded HSACO + dispatch),
+# --impl jit runs the FlyDSL kernel in-process. Both compared vs a torch reference.
+<venv>/bin/python fly/test_rotary.py                          # fused fp8 GEMM+rotary   (abi|jit)
+<venv>/bin/python fly/test_dual_gemm_silu.py                  # fused fp8 dual GEMM+SiLU (abi|jit)
+<venv>/bin/python fly/test_factored_lstm.py                   # fused factored-LSTM step (jit; DSL-only)
 ```
 
 ## Benchmark
