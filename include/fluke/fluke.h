@@ -56,6 +56,16 @@ void fluke_rotary_emb_gpu(
     int stride_head
 );
 
+// SiLU-gated multiply. `in` is [n_tokens, 2*hidden_dim] laid out as [y | gate]
+// (y = first hidden_dim cols, gate = next hidden_dim cols); `out` is
+// [n_tokens, hidden_dim] with out[t,k] = silu(gate[t,k]) * y[t,k].
+void fluke_silu_mul_gpu(
+    const void *in,
+    void *out,
+    int n_tokens,
+    int hidden_dim
+);
+
 #endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 #ifdef __cplusplus

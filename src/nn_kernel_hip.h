@@ -68,6 +68,27 @@ static __global__ void rotary_emb(
     }
 }
 
+static __global__ void silu_mul(
+	const half *in,
+	half *out,
+    const uint64_t hidden_dim,
+    const uint64_t n_tokens
+) {
+    uint64_t j = blockIdx.x;
+
+    for (uint64_t k = threadIdx.x; k < hidden_dim; k += blockDim.x) {
+        uint64_t i = k + j * (hidden_dim * 2);
+
+        half y = in[i];
+        half gate = in[i + hidden_dim];
+
+        float g = __half2float(gate);
+        float silu = g / (1.0f + __expf(-g));
+
+        out[k + j * hidden_dim] = __float2half(silu * __half2float(y));
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

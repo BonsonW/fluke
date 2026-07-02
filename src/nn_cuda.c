@@ -39,3 +39,23 @@ void fluke_rotary_emb_gpu(
     cudaDeviceSynchronize();
     checkCudaError();
 }
+
+void fluke_silu_mul_gpu(
+    const void *in,
+    void *out,
+    int n_tokens,
+    int hidden_dim
+) {
+    int threads = 1024;
+    int blocks = n_tokens;
+
+    silu_mul<<<blocks, threads>>>(
+        (const half *)in,
+        (half *)out,
+        hidden_dim,
+        n_tokens
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}

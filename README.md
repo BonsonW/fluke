@@ -59,6 +59,12 @@ for how every other kernel is organised:
   `cute/test_rotary.py` (the DSL kernel — jit or aot — vs torch and/or the pure CUDA C
   kernel), and `cute/test_gemm.py` (the base INT8 GEMM vs an fp16 torch GEMM).
 
+The **dual INT8 GEMM + SiLU** kernel follows the same template: implementation in
+`cute/ampere/dual_gemm_silu/` (`dual_gemm_i8_silu.py` + `export_dual_gemm_i8_silu.py`),
+pure CUDA C epilogue `fluke_silu_mul_gpu` (`src/nn_cuda.c`), tested by
+`cute/test_dual_gemm_silu.py` (`out = silu(A@Bg^T) * (A@Bu^T)`; jit/aot vs torch and/or
+the pure CUDA C `silu_mul`).
+
 ## Build
 
 ```
@@ -75,6 +81,7 @@ make                                                          # CPU-only
 <venv>/bin/python cute/test_rotary.py --impl aot              # exported .o (load_module) instead
 <venv>/bin/python cute/test_rotary.py --impl aot --ref torch  # pick impl + reference
 <venv>/bin/python cute/test_gemm.py                           # INT8 GEMM vs fp16 torch GEMM
+<venv>/bin/python cute/test_dual_gemm_silu.py                 # dual GEMM+SiLU: jit/aot vs torch + cuda C
 <venv>/bin/python cute/ampere/rotary/export_gemm_i8_rotary.py # AOT export only (config inlined)
 ```
 
@@ -86,4 +93,5 @@ reporting TOPS + effective bandwidth):
 ```
 <venv>/bin/python cute/bench_gemm.py                          # INT8 GEMM  (--M --N --K)
 <venv>/bin/python cute/bench_rotary.py                        # fused INT8 GEMM+rotary  (--M --K --nhead ...)
+<venv>/bin/python cute/bench_dual_gemm_silu.py                # fused dual INT8 GEMM+SiLU  (--M --N --K)
 ```
