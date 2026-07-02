@@ -17,62 +17,28 @@ generation, the references, running the chosen implementation, and the compariso
     <venv>/bin/python cute/test_rotary.py --impl aot         # exported .o, vs torch+cuda
     <venv>/bin/python cute/test_rotary.py --arch ampere --ref torch
 
-Exit 0 on PASS, 1 otherwise. Needs a CUDA torch + CUDA toolkit + ninja.
+Exit 0 on PASS, 1 otherwise. Needs a CUDA torch + CUDA toolkit.
 """
 import argparse
 import os
 import sys
 import types
 
-# CUDA_HOME / PATH must be set before importing torch.utils.cpp_extension.
-CUDA_HOME = os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ["PATH"] = os.pathsep.join([
-    os.path.dirname(sys.executable),
-    os.path.join(CUDA_HOME, "bin"),
-    os.environ.get("PATH", ""),
-])
-
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from torch.utils.cpp_extension import load_inline
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # cute/ (common)
 import common
+sys.path.insert(0, common.ROOT)                                  # fluke root (fluke_lib)
+import fluke_lib
 
 ABS_TOL = 0.05
 
 # JIT tiling config (the AOT path uses whatever the export script baked in).
 JIT_ATOM_LAYOUT, JIT_NUM_STAGES, JIT_USE_K32 = (2, 2, 1), 3, True
 JIT_BM, JIT_BN, JIT_BK = 128, 128, 64
-
-# ── pure CUDA C reference binding (the real fluke_rotary_emb_gpu, src/nn_cuda.c) ──
-CPP_SRC = r"""
-#include <torch/extension.h>
-#include <fluke/fluke.h>
-#include <cuda_runtime.h>
-// x: [batch, seq, n_heads, head_dim] fp16, CUDA, contiguous. Rotates in place.
-void rotary_emb(torch::Tensor x, torch::Tensor sin, torch::Tensor cos, int64_t sincos_width) {
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.dim() == 4, "bad x");
-    fluke_rotary_emb_gpu(
-        x.data_ptr(), sin.data_ptr(), cos.data_ptr(),
-        x.size(0), x.size(1), x.size(2), x.size(3), (int)sincos_width,
-        (int)x.stride(0), (int)x.stride(1), (int)x.stride(2));
-}
-"""
-CUDA_SRC = "#include \"error.c\"\n#include \"nn_cuda.c\"\n"
-
-
-def pure_cuda_module():
-    return load_inline(
-        name="fluke_rotary_cmp",
-        cpp_sources=CPP_SRC, cuda_sources=CUDA_SRC, functions=["rotary_emb"],
-        extra_include_paths=[os.path.join(common.ROOT, "include"), os.path.join(common.ROOT, "src")],
-        extra_cflags=["-DHAVE_CUDA=1", "-O2"],
-        extra_cuda_cflags=["-DHAVE_CUDA=1", "-O2", "--expt-relaxed-constexpr"],
-        with_cuda=True, verbose=False,
-    )
 
 
 # ── build the padded CuTe descriptors the kernel consumes ─────────────────────
@@ -142,14 +108,17 @@ def torch_reference(C_gemm, sin_buf, cos_buf, d):
 
 
 def cuda_reference(C_gemm, sin_buf, cos_buf, d):
-    """Pure CUDA C kernel: rotate Q/K chunks of the fp16 dequant GEMM in place."""
-    mod = pure_cuda_module()
+    """Pure CUDA C kernel (libfluke.so via ctypes): rotate Q/K chunks in place."""
+    lib = fluke_lib.load()
     C = C_gemm.to(torch.float16)
     q_end = d.nhead * d.head_dim
     for chunk_start in (0, q_end):
         chunk = C[:, chunk_start:chunk_start + q_end].contiguous().view(
             d.batch_size, d.sequence_len, d.nhead, d.head_dim)
-        mod.rotary_emb(chunk, sin_buf, cos_buf, d.sincos_width)
+        lib.fluke_rotary_emb_gpu(
+            chunk.data_ptr(), sin_buf.data_ptr(), cos_buf.data_ptr(),
+            d.batch_size, d.sequence_len, d.nhead, d.head_dim, d.sincos_width,
+            chunk.stride(0), chunk.stride(1), chunk.stride(2))
         C[:, chunk_start:chunk_start + q_end] = chunk.view(d.M, q_end)
     torch.cuda.synchronize()
     return C.float()

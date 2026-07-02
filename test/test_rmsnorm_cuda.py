@@ -1,126 +1,46 @@
 """Build-and-run test for the CUDA RMSNorm kernels.
 
-Single script: it JIT-compiles the real CUDA kernels (src/nn_cuda.c) plus a tiny
-torch binding with ninja (torch.utils.cpp_extension), runs fluke_rmsnorm_gpu
-and fluke_rmsnorm_quant_int8_gpu on the GPU, and diffs the result against a
-torch reference -> PASS/FAIL. Also benchmarks each kernel with CUDA events.
+Builds lib/libfluke.so via `make` (fluke_lib) and calls the real fluke_rmsnorm_gpu /
+fluke_rmsnorm_quant_int8_gpu through ctypes, diffing against a torch reference ->
+PASS/FAIL. Also benchmarks each with CUDA events.
 
     ./pyvenv/bin/python test/test_rmsnorm_cuda.py
 
 Requires a CUDA-enabled torch (see test/requirements.txt) and a CUDA toolkit.
 (The fp8 fused kernel is not implemented on CUDA, so it is not covered here.)
 """
-
 import os
 import sys
 
-# CUDA_HOME must be set before importing torch.utils.cpp_extension (it is
-# resolved at import time). The ninja and nvcc binaries also need to be on PATH
-# for the subprocess build (the venv's bin holds the pip-installed ninja).
-CUDA_HOME = os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ["PATH"] = os.pathsep.join([
-    os.path.dirname(sys.executable),
-    os.path.join(CUDA_HOME, "bin"),
-    os.environ.get("PATH", ""),
-])
-# A100 = 8.0; override via env for other GPUs.
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
-
 import torch
-from torch.utils.cpp_extension import load_inline
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)   # fluke root (fluke_lib)
+import fluke_lib
 
-# C++ binding (compiled by the host compiler). It calls the real
-# fluke_rmsnorm_gpu / fluke_rmsnorm_quant_int8_gpu launch wrappers.
-CPP_SRC = r"""
-#include <torch/extension.h>
-#include <fluke/fluke.h>
-#include <cuda_runtime.h>
 
-// out = rmsnorm(in + alpha*residual) * weight   (fp32 math, fp16 out)
-void rmsnorm(torch::Tensor in, torch::Tensor residual, torch::Tensor weight,
-             torch::Tensor out, double alpha, double eps) {
-    TORCH_CHECK(in.is_cuda() && residual.is_cuda() && weight.is_cuda() && out.is_cuda(),
-                "tensors must be CUDA");
-    TORCH_CHECK(in.scalar_type() == torch::kHalf, "in must be fp16");
-    const int n_tokens   = in.size(0);
-    const int hidden_dim = in.size(1);
-    fluke_rmsnorm_gpu(in.data_ptr(), residual.data_ptr(), weight.data_ptr(),
-                         out.data_ptr(), n_tokens, hidden_dim, (float)alpha, (float)eps);
-}
+def run_rmsnorm(lib, in_, residual, weight, out, alpha, eps):
+    lib.fluke_rmsnorm_gpu(
+        in_.data_ptr(), residual.data_ptr(), weight.data_ptr(), out.data_ptr(),
+        in_.size(0), in_.size(1), float(alpha), float(eps))
 
-// In-place: residual (int8) and residual_scale (f32, per-token) are read as the
-// previous quantized residual and overwritten with the new quantized rmsnorm.
-void rmsnorm_quant_int8(torch::Tensor in, torch::Tensor weight,
-                        torch::Tensor residual, torch::Tensor residual_scale,
-                        double alpha, double eps) {
-    TORCH_CHECK(in.is_cuda() && weight.is_cuda() && residual.is_cuda() && residual_scale.is_cuda(),
-                "tensors must be CUDA");
-    TORCH_CHECK(in.scalar_type() == torch::kHalf, "in must be fp16");
-    TORCH_CHECK(residual.scalar_type() == torch::kChar, "residual must be int8");
-    const int n_tokens   = in.size(0);
-    const int hidden_dim = in.size(1);
-    fluke_rmsnorm_quant_int8_gpu(in.data_ptr(), weight.data_ptr(), residual.data_ptr(),
-                                    residual_scale.data_ptr(), n_tokens, hidden_dim,
-                                    (float)alpha, (float)eps);
-}
 
-double rmsnorm_bench(torch::Tensor in, torch::Tensor residual, torch::Tensor weight,
-                     torch::Tensor out, double alpha, double eps,
-                     int64_t warmup, int64_t iters) {
-    const int n_tokens   = in.size(0);
-    const int hidden_dim = in.size(1);
-    for (int i = 0; i < warmup; ++i)
-        fluke_rmsnorm_gpu(in.data_ptr(), residual.data_ptr(), weight.data_ptr(),
-                             out.data_ptr(), n_tokens, hidden_dim, (float)alpha, (float)eps);
-    cudaDeviceSynchronize();
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
-    cudaEventRecord(start);
-    for (int i = 0; i < iters; ++i)
-        fluke_rmsnorm_gpu(in.data_ptr(), residual.data_ptr(), weight.data_ptr(),
-                             out.data_ptr(), n_tokens, hidden_dim, (float)alpha, (float)eps);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms = 0.0f; cudaEventElapsedTime(&ms, start, stop);
-    cudaEventDestroy(start); cudaEventDestroy(stop);
-    return (double)ms / (double)iters;
-}
+def run_rmsnorm_quant_int8(lib, in_, weight, residual, residual_scale, alpha, eps):
+    lib.fluke_rmsnorm_quant_int8_gpu(
+        in_.data_ptr(), weight.data_ptr(), residual.data_ptr(), residual_scale.data_ptr(),
+        in_.size(0), in_.size(1), float(alpha), float(eps))
 
-double rmsnorm_quant_int8_bench(torch::Tensor in, torch::Tensor weight,
-                                torch::Tensor residual, torch::Tensor residual_scale,
-                                double alpha, double eps, int64_t warmup, int64_t iters) {
-    const int n_tokens   = in.size(0);
-    const int hidden_dim = in.size(1);
-    for (int i = 0; i < warmup; ++i)
-        fluke_rmsnorm_quant_int8_gpu(in.data_ptr(), weight.data_ptr(), residual.data_ptr(),
-                                        residual_scale.data_ptr(), n_tokens, hidden_dim,
-                                        (float)alpha, (float)eps);
-    cudaDeviceSynchronize();
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
-    cudaEventRecord(start);
-    for (int i = 0; i < iters; ++i)
-        fluke_rmsnorm_quant_int8_gpu(in.data_ptr(), weight.data_ptr(), residual.data_ptr(),
-                                        residual_scale.data_ptr(), n_tokens, hidden_dim,
-                                        (float)alpha, (float)eps);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms = 0.0f; cudaEventElapsedTime(&ms, start, stop);
-    cudaEventDestroy(start); cudaEventDestroy(stop);
-    return (double)ms / (double)iters;
-}
-"""
 
-# Compile the real kernel translation unit straight into the extension (nvcc,
-# -fPIC) instead of linking lib/libfluke.a, whose objects are built without
-# -fPIC and so cannot go into a shared object. This still exercises the actual
-# launch wrappers from src/nn_cuda.c.
-CUDA_SRC = r"""
-#include "error.c"
-#include "nn_cuda.c"
-"""
+def bench(call, warmup, iters):
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True); stop = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        call()
+    stop.record(); torch.cuda.synchronize()
+    return start.elapsed_time(stop) / iters
 
 
 def ref_rmsnorm(in_, residual, weight, alpha, eps):
@@ -144,19 +64,7 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("CUDA torch not available; install torch with CUDA (see test/requirements.txt)")
 
-    print(">> JIT-compiling CUDA kernels + binding with ninja")
-    mod = load_inline(
-        name="fluke_rmsnorm_test",
-        cpp_sources=CPP_SRC,
-        cuda_sources=CUDA_SRC,
-        functions=["rmsnorm", "rmsnorm_quant_int8", "rmsnorm_bench", "rmsnorm_quant_int8_bench"],
-        extra_include_paths=[os.path.join(ROOT, "include"), os.path.join(ROOT, "src")],
-        extra_cflags=["-DHAVE_CUDA=1", "-O2"],
-        extra_cuda_cflags=["-DHAVE_CUDA=1", "-O2", "--expt-relaxed-constexpr"],
-        with_cuda=True,
-        verbose=False,
-    )
-
+    lib = fluke_lib.load()
     dev = "cuda"
     torch.manual_seed(0)
     alpha, eps = 2.0, 1e-5
@@ -168,7 +76,7 @@ def main():
     residual = torch.randn(n_tokens, hidden_dim, device=dev, dtype=torch.float16)
     weight = torch.randn(hidden_dim, device=dev, dtype=torch.float16)
     out = torch.empty_like(in_)
-    mod.rmsnorm(in_, residual, weight, out, alpha, eps)
+    run_rmsnorm(lib, in_, residual, weight, out, alpha, eps)
     torch.cuda.synchronize()
     expected = ref_rmsnorm(in_, residual, weight, alpha, eps)
     max_diff = (out.to(torch.float32) - expected.to(torch.float32)).abs().max().item()
@@ -185,7 +93,7 @@ def main():
         in8, weight8, residual8.clone(), res_scale.clone(), alpha, eps)
     q_got = residual8.clone()
     scale_got = res_scale.clone()
-    mod.rmsnorm_quant_int8(in8, weight8, q_got, scale_got, alpha, eps)
+    run_rmsnorm_quant_int8(lib, in8, weight8, q_got, scale_got, alpha, eps)
     torch.cuda.synchronize()
     # Compare in dequantized space (a single int8 level near boundaries can differ
     # by 1 due to fp rounding order); scale should match closely.
@@ -213,7 +121,7 @@ def main():
         residual = torch.randn(n_tokens, hidden_dim, device=dev, dtype=torch.float16)
         weight = torch.randn(hidden_dim, device=dev, dtype=torch.float16)
         out = torch.empty_like(in_)
-        ms = mod.rmsnorm_bench(in_, residual, weight, out, alpha, eps, 20, 100)
+        ms = bench(lambda: run_rmsnorm(lib, in_, residual, weight, out, alpha, eps), 20, 100)
         # in + residual read (2B each) + out write (2B) + weight read (2B)
         bytes_moved = n_tokens * hidden_dim * (2 + 2 + 2) + hidden_dim * 2
         gbps = bytes_moved / (ms * 1e-3) / 1e9
@@ -221,7 +129,7 @@ def main():
 
         residual8 = torch.randint(-127, 128, (n_tokens, hidden_dim), device=dev, dtype=torch.int8)
         res_scale = torch.rand(n_tokens, device=dev, dtype=torch.float32) * 0.02 + 0.001
-        ms = mod.rmsnorm_quant_int8_bench(in_, weight, residual8, res_scale, alpha, eps, 20, 100)
+        ms = bench(lambda: run_rmsnorm_quant_int8(lib, in_, weight, residual8, res_scale, alpha, eps), 20, 100)
         # in read (2B) + residual read+write (1B each) + weight read (2B)
         bytes_moved = n_tokens * hidden_dim * (2 + 1 + 1) + hidden_dim * 2
         gbps = bytes_moved / (ms * 1e-3) / 1e9

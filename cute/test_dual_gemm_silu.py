@@ -16,53 +16,24 @@ The tiling config is taken from the export module so jit/aot/export can't drift.
     <venv>/bin/python cute/test_dual_gemm_silu.py
     <venv>/bin/python cute/test_dual_gemm_silu.py --impl aot --ref torch
 
-Exit 0 on PASS, 1 otherwise. Needs a CUDA torch + CUDA toolkit + ninja.
+Exit 0 on PASS, 1 otherwise. Needs a CUDA torch + CUDA toolkit.
 """
 import argparse
 import os
 import sys
 import types
 
-# CUDA_HOME / PATH must be set before importing torch.utils.cpp_extension.
-CUDA_HOME = os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ["PATH"] = os.pathsep.join([
-    os.path.dirname(sys.executable), os.path.join(CUDA_HOME, "bin"), os.environ.get("PATH", ""),
-])
-
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from torch.utils.cpp_extension import load_inline
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # cute/ (common)
 import common
+sys.path.insert(0, common.ROOT)                                  # fluke root (fluke_lib)
+import fluke_lib
 
 ABS_TOL = 0.05
-
-# ── pure CUDA C reference binding (the real fluke_silu_mul_gpu, src/nn_cuda.c) ────
-CPP_SRC = r"""
-#include <torch/extension.h>
-#include <fluke/fluke.h>
-#include <cuda_runtime.h>
-// in: [n_tokens, 2*hidden] = [y | gate] fp16; out: [n_tokens, hidden] = silu(gate)*y.
-void silu_mul(torch::Tensor in, torch::Tensor out) {
-    TORCH_CHECK(in.is_cuda() && in.scalar_type() == torch::kHalf, "in must be CUDA fp16");
-    fluke_silu_mul_gpu(in.data_ptr(), out.data_ptr(), (int)in.size(0), (int)out.size(1));
-}
-"""
-CUDA_SRC = "#include \"error.c\"\n#include \"nn_cuda.c\"\n"
-
-
-def pure_cuda_module():
-    return load_inline(
-        name="fluke_silu_mul_cmp",
-        cpp_sources=CPP_SRC, cuda_sources=CUDA_SRC, functions=["silu_mul"],
-        extra_include_paths=[os.path.join(common.ROOT, "include"), os.path.join(common.ROOT, "src")],
-        extra_cflags=["-DHAVE_CUDA=1", "-O2"],
-        extra_cuda_cflags=["-DHAVE_CUDA=1", "-O2", "--expt-relaxed-constexpr"],
-        with_cuda=True, verbose=False,
-    )
 
 
 # ── build the padded CuTe descriptors the kernel consumes ─────────────────────
@@ -127,7 +98,7 @@ def torch_reference(A_i8, Bg_i8, Bu_i8, sa, sbg, sbu):
 
 def cuda_reference(A_i8, Bg_i8, Bu_i8, sa, sbg, sbu):
     """torch GEMMs (fp16), then the pure CUDA C fluke_silu_mul_gpu on [up | gate]."""
-    mod = pure_cuda_module()
+    lib = fluke_lib.load()
     A = A_i8.float().cuda() * sa.cuda()[:, None]
     Bg = Bg_i8.float().cuda() * sbg.cuda()[:, None]
     Bu = Bu_i8.float().cuda() * sbu.cuda()[:, None]
@@ -136,7 +107,7 @@ def cuda_reference(A_i8, Bg_i8, Bu_i8, sa, sbg, sbu):
     # silu_mul does out = silu(second half) * first half, so pass [up | gate].
     in2n = torch.cat([up, gate], dim=1).contiguous()
     out = torch.empty_like(gate)
-    mod.silu_mul(in2n, out)
+    lib.fluke_silu_mul_gpu(in2n.data_ptr(), out.data_ptr(), in2n.size(0), out.size(1))
     torch.cuda.synchronize()
     return out.float()
 

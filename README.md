@@ -45,6 +45,11 @@ The test imports the arch's implementation for the GPU it's running on via
 = drop its implementation under `cute/<newarch>/...` and add the compute capability to
 `ARCH_BY_CC` in `common.py`. (A HIP/fly mirror would live under `fly/`; not built yet.)
 
+The **`--ref cuda`** path (and the `test/*.py` pure-C-library tests) call the real C ABI
+through `ctypes` on `lib/libfluke.so` — no inline C++/nvcc recompile. `fluke_lib.load()`
+builds the shared lib on demand (`make shared` for the detected arch) and returns a
+ctypes handle with argtypes set; this is the same C ABI slorado calls in production.
+
 ## The rotary embedding kernel (template)
 
 The Ampere (sm80) rotary embedding kernel is the first kernel and the template
@@ -74,10 +79,13 @@ ported — openfish leaves it unimplemented on CUDA.
 ## Build
 
 ```
-make cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80"   # -> lib/libfluke.a
-make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"                # HIP backend
-make                                                          # CPU-only
+make cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80"          # -> lib/libfluke.a
+make shared cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80"   # -> lib/libfluke.so (PIC, for tests)
+make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"                       # HIP backend
+make                                                                 # CPU-only
 ```
+
+(The Python tests build `lib/libfluke.so` automatically via `fluke_lib` if it's missing.)
 
 ## Test
 

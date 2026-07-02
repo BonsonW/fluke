@@ -1,9 +1,8 @@
-# Reference/test deps for the rotary embedding kernel (test/*.py).
+# Reference/test deps for the pure C library tests (test/*.py).
 #
-# test_rotary_cuda.py JIT-compiles a CUDA binding with ninja and runs it on the
-# GPU, so it needs a CUDA-enabled torch (NOT the +cpu build) plus a CUDA toolkit
-# (CUDA_HOME, default /usr/local/cuda). Matches the working ../quantrnn setup.
+# The tests build lib/libfluke.so with `make` and call the C ABI via ctypes, then
+# compare against a torch reference. They need a CUDA-enabled torch (NOT the +cpu
+# build) plus a CUDA toolkit (CUDA_HOME, default /usr/local/cuda) to build the lib.
 #
 #   pip install --index-url https://download.pytorch.org/whl/cu126 -r test/requirements.txt
 torch==2.7.1
-ninja==1.11.*

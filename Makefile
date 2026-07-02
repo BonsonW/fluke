@@ -1,13 +1,14 @@
 CC = gcc
 AR = ar
 CPPFLAGS += -I include/
-CFLAGS += -g -Wall -O2
+CFLAGS += -g -Wall -O2 -fPIC
 # auto-generate header dependencies so editing a .h (e.g. nn_kernel_cuda.h) rebuilds dependent objects
 DEPFLAGS = -MMD -MP
 LDFLAGS += $(LIBS) -lm -lpthread
 BUILD_DIR = lib
 
 STATICLIB = $(BUILD_DIR)/libfluke.a
+SHAREDLIB = $(BUILD_DIR)/libfluke.so
 
 # CPU-portable objects (always built)
 OBJ = $(BUILD_DIR)/misc.o \
@@ -15,6 +16,8 @@ OBJ = $(BUILD_DIR)/misc.o \
 	  $(BUILD_DIR)/nn_cpu.o \
 
 GPU_LIB =
+GPU_OBJ =
+SHARED_LINK = $(CC) -shared
 
 # make asan=1 enables address sanitiser
 ifdef asan
@@ -29,9 +32,11 @@ ifdef cuda
     CUDA_LIB ?= $(CUDA_ROOT)/lib64
     CUDA_OBJ += $(BUILD_DIR)/nn_cuda.o
     NVCC ?= $(CUDA_ROOT)/bin/nvcc
-    CUDA_CFLAGS += -g -O2 -lineinfo $(CUDA_ARCH) -Xcompiler -Wall
+    CUDA_CFLAGS += -g -O2 -lineinfo $(CUDA_ARCH) -Xcompiler -Wall -Xcompiler -fPIC
     CUDA_LDFLAGS = -L$(CUDA_LIB) -lcudart_static -lrt -ldl
     GPU_LIB = $(BUILD_DIR)/cuda.a
+    GPU_OBJ = $(CUDA_OBJ)
+    SHARED_LINK = $(NVCC) -shared $(CUDA_ARCH)
     CPPFLAGS += -DHAVE_CUDA=1
 # make rocm=1 builds the HIP backend (hipcc). Set ROCM_ARCH, e.g.
 #   make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"
@@ -42,6 +47,8 @@ else ifdef rocm
 	ROCM_CFLAGS += -g -Wall $(ROCM_ARCH)
 	ROCM_OBJ += $(BUILD_DIR)/nn_hip.o
 	GPU_LIB = $(BUILD_DIR)/hip_code.a
+	GPU_OBJ = $(ROCM_OBJ)
+	SHARED_LINK = $(HIPCC) -shared $(ROCM_ARCH)
 	ROCM_LDFLAGS = -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
 	CPPFLAGS += -DHAVE_ROCM=1
 else
@@ -53,13 +60,18 @@ ifdef debug
 	CFLAGS += -fopenmp
 endif
 
-.PHONY: all clean distclean
+.PHONY: all shared clean distclean
 
 all: $(STATICLIB)
+shared: $(SHAREDLIB)
 
 $(STATICLIB): $(OBJ) $(GPU_LIB)
 	cp $(GPU_LIB) $@
 	$(AR) rcs $@ $(OBJ)
+
+# Shared lib (PIC) for ctypes-based Python tests: all objects go straight into the .so.
+$(SHAREDLIB): $(OBJ) $(GPU_OBJ)
+	$(SHARED_LINK) -o $@ $(OBJ) $(GPU_OBJ) $(LDFLAGS)
 
 $(BUILD_DIR)/misc.o: src/misc.c src/misc.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -c $< -o $@
