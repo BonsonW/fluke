@@ -3,7 +3,7 @@
 Two-way check (there is no pure-CUDA GEMM counterpart in src/ — the GEMMs are
 DSL-only):
   ref  - torch: dequantize the int8 inputs to fp16, matmul (fp32 accumulate), fp16 out.
-  cute - the arch's INT8 GEMM (cute/<arch>/gemm_i8_quant.py, TensorOpGemmI8), which
+  cute - the arch's INT8 GEMM (cute/<arch>/gemm/gemm_i8_quant.py, TensorOpGemmI8), which
          int32-accumulates then applies the per-token/per-channel dequant scales.
 
     <venv>/bin/python cute/test_gemm.py                 # auto-detect arch
@@ -66,7 +66,7 @@ def main():
     arch = args.arch or common.detect_arch()
     print(f"Arch: {arch}  (GPU {torch.cuda.get_device_name(0)}, cc {torch.cuda.get_device_capability()})")
 
-    kern = common.import_impl(arch, "", "gemm_i8_quant")
+    kern = common.import_impl(arch, "gemm", "gemm_i8_quant")
 
     d = types.SimpleNamespace()
     d.M, d.N, d.K, d.L = 256, 768, 512, 1
@@ -78,7 +78,7 @@ def main():
     B_int8, scale_b = common.quantize_tensor(torch.randn(d.N, d.K) * 0.1, dim=-1)
 
     # ── (1) cute: run the INT8 GEMM ───────────────────────────────────────────
-    print(f"Running INT8 GEMM from cute/{arch}/gemm_i8_quant.py ...")
+    print(f"Running INT8 GEMM from cute/{arch}/gemm/gemm_i8_quant.py ...")
     C_cute = run_jit(kern, A_int8, B_int8, scale_a, scale_b, d)
 
     # ── (2) ref: fp16 torch GEMM of the dequantized inputs ────────────────────

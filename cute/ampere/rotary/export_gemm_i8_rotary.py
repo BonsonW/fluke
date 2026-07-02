@@ -13,7 +13,8 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                    # this dir (gemm_i8_rotary)
-sys.path.insert(0, os.path.dirname(_HERE))   # parent cute/ampere (gemm_i8_quant base class)
+sys.path.insert(0, os.path.dirname(_HERE))          # parent cute/ampere
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "gemm"))  # shared base classes (gemm_i8_quant, gemm_f16)
 from gemm_i8_rotary import export_gemm_i8_rotary
 
 # ── export configuration ──────────────────────────────────────────────────────

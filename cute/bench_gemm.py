@@ -72,7 +72,7 @@ def main():
     arch = args.arch or common.detect_arch()
     print(f"Arch: {arch}  (GPU {torch.cuda.get_device_name(0)}, cc {torch.cuda.get_device_capability()})")
 
-    kern = common.import_impl(arch, "", "gemm_i8_quant")
+    kern = common.import_impl(arch, "gemm", "gemm_i8_quant")
     d = types.SimpleNamespace(M=args.M, N=args.N, K=args.K, L=1)
     mA, mB, mC, mSA, mSB = build(kern, d)
 

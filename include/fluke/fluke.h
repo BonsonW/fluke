@@ -67,6 +67,10 @@ void fluke_flstm_step_cpu(
     int n_threads
 );
 
+// Model dimensions a backend must match (kernels are dimension-specialized). Build-agnostic: the
+// ATen wrapper's public API takes it on every build (int8 selection is a no-op on CPU-only builds).
+typedef struct { int d_model, dim_feedforward, nhead, head_dim, max_seq; } fluke_dims_t;
+
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 // out = rmsnorm(in + alpha*residual) * weight. in/residual/weight/out are fp16
@@ -140,9 +144,6 @@ void fluke_flstm_step_gpu(
 // consumers (e.g. slorado) just pass device pointers + dims. Only available where a
 // matching precompiled backend exists (CUDA >= 12 on a supported arch); otherwise
 // fluke_int8_select returns NULL and the caller keeps its fp16 path.
-
-// Model dimensions a backend must match (kernels are dimension-specialized).
-typedef struct { int d_model, dim_feedforward, nhead, head_dim, max_seq; } fluke_dims_t;
 
 // Opaque, process-lifetime backend handle. Loads the arch's kernel module(s) once.
 // Returns NULL if no precompiled backend matches this device's arch and `dims`.

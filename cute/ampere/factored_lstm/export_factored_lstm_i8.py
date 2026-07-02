@@ -19,7 +19,8 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                    # this dir (factored_lstm_i8)
-sys.path.insert(0, os.path.dirname(_HERE))   # parent cute/ampere (gemm_i8_quant base)
+sys.path.insert(0, os.path.dirname(_HERE))          # parent cute/ampere
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "gemm"))  # shared base classes (gemm_i8_quant, gemm_f16)
 
 import cutlass
 from factored_lstm_i8 import export_factored_lstm_i8

@@ -24,7 +24,7 @@ test/                            python tests for the pure C library (load_inlin
 artifacts/                       AOT-exported .h/.o (top-level, shared; gitignored)
 cute/common.py                   shared test helpers (arch dispatch, quantize, report)
 cute/test_<op>.py                per-op test: picks an impl + reference, compares
-cute/<arch>/gemm_i8_quant.py     the INT8 GEMM implementation (+ base for other kernels)
+cute/<arch>/gemm/                the INT8 (gemm_i8_quant) + f16 (gemm_f16) GEMM bases, shared by all ops
 cute/<arch>/<op>/                per-op implementation: DSL kernel + export script
 fly/<arch>/                      FlyDSL kernels per microarch (rdna4, cdna3, ...); stub
 ```
@@ -58,7 +58,7 @@ for how every other kernel is organised:
 - Pure CUDA kernel: `src/nn_kernel_cuda.h` (`rotary_emb`) + launch wrapper
   `src/nn_cuda.c` (`fluke_rotary_emb_gpu`); CPU reference in `src/nn_cpu.c`.
 - CuTe fused INT8 GEMM+rotary implementation: `cute/ampere/rotary/gemm_i8_rotary.py`
-  (+ shared base class `cute/ampere/gemm_i8_quant.py`), exported by
+  (+ shared base class `cute/ampere/gemm/gemm_i8_quant.py`), exported by
   `cute/ampere/rotary/export_gemm_i8_rotary.py` (config inlined at the top) to `artifacts/`.
 - Tests: `test/test_rotary_cuda.py` (pure CUDA vs torch, standalone C-lib test),
   `cute/test_rotary.py` (the DSL kernel — jit or aot — vs torch and/or the pure CUDA C
@@ -77,7 +77,7 @@ The **factored LSTM** layer follows the same template but is two kernels (see sl
 up-projections into four gate accumulators + gates + cell update + INT8 hidden output
 (fixed scale 1/127). Faithful to the RDNA fp8 original, only the down-projection and the
 h output are INT8; the up-projections stay f16 (via the plain f16 GEMM base
-`cute/ampere/gemm_f16.py`, `TensorOpGemm`, which the fused step inherits). Both kernels
+`cute/ampere/gemm/gemm_f16.py`, `TensorOpGemm`, which the fused step inherits). Both kernels
 are exported by `cute/ampere/factored_lstm/export_factored_lstm_i8.py` (the fused step is
 K-merged: A = [hh_down | x_down], per-gate weight W_g = [up_hh_g | up_ih_g]). Tested by
 `cute/test_factored_lstm.py` (jit/aot vs torch; DSL-only, no pure-CUDA C ref).

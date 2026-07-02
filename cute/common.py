@@ -37,9 +37,12 @@ def detect_arch():
 
 
 def import_impl(arch, subdir, module):
-    """Import `module` from cute/<arch>/<subdir> (also puts cute/<arch> on the path
-    so the module's shared base-class imports, e.g. gemm_i8_quant, resolve)."""
-    for p in (os.path.join(CUTE_DIR, arch, subdir), os.path.join(CUTE_DIR, arch)):
+    """Import `module` from cute/<arch>/<subdir>. Also puts cute/<arch> and the shared
+    cute/<arch>/gemm dir on the path so the base-class imports (`from gemm_i8_quant import`,
+    `from gemm_f16 import`) resolve from any op subdir."""
+    for p in (os.path.join(CUTE_DIR, arch, subdir),
+              os.path.join(CUTE_DIR, arch, "gemm"),
+              os.path.join(CUTE_DIR, arch)):
         if p not in sys.path:
             sys.path.insert(0, p)
     return importlib.import_module(module)
