@@ -60,7 +60,7 @@ for how every other kernel is organised:
 - CuTe fused INT8 GEMM+rotary implementation: `cute/ampere/rotary/gemm_i8_rotary.py`
   (+ shared base class `cute/ampere/gemm/gemm_i8_quant.py`), exported by
   `cute/ampere/rotary/export_gemm_i8_rotary.py` (config inlined at the top) to `artifacts/`.
-- Tests: `test/test_rotary_cuda.py` (pure CUDA vs torch, standalone C-lib test),
+- Tests: `test/test_rotary_gpu.py` (pure GPU C kernel vs torch, standalone C-lib test),
   `cute/test_rotary.py` (the DSL kernel — jit or aot — vs torch and/or the pure CUDA C
   kernel), and `cute/test_gemm.py` (the base INT8 GEMM vs an fp16 torch GEMM).
 
@@ -84,9 +84,14 @@ K-merged: A = [hh_down | x_down], per-gate weight W_g = [up_hh_g | up_ih_g]). Te
 
 **RMSNorm** is pure C/CUDA only (no CuTe DSL): `fluke_rmsnorm_gpu` and the fused
 `fluke_rmsnorm_quant_int8_gpu` in `src/` (CUDA + HIP), with a fp32 CPU reference
-`fluke_rmsnorm_cpu` for the non-quant kernel only. Tested by `test/test_rmsnorm_cuda.py`
-(CUDA kernels vs a naive torch reference; `load_inline`). The fp8 quant variant is not
-ported — openfish leaves it unimplemented on CUDA.
+`fluke_rmsnorm_cpu` for the non-quant kernel only. Tested by `test/test_rmsnorm_gpu.py`
+(CUDA kernels vs a naive torch reference; `load_inline`).
+
+The **fp8** variants are also pure C/CUDA+HIP: `fluke_rmsnorm_quant_fp8_gpu` (fused RMSNorm +
+E4M3FN quantize) and `fluke_dequant_fp8_transpose_gpu` (dequant + transpose in one pass), plus an
+int8 analogue `fluke_dequant_int8_transpose_gpu`. fp8 uses **software E4M3FN conversion**
+(`e4m3fn_to_float`/`float_to_e4m3fn`, bit-exact vs PyTorch `float8_e4m3fn`), so it runs on CUDA too
+(openfish shipped these HIP-only). Tested by `test/test_fp8_gpu.py`.
 
 ## Build
 
@@ -102,8 +107,9 @@ make                                                                 # CPU-only
 ## Test
 
 ```
-<venv>/bin/python test/test_rotary_cuda.py                    # pure CUDA rotary vs torch ref
-<venv>/bin/python test/test_rmsnorm_cuda.py                   # pure CUDA rmsnorm (+quant int8) vs torch
+<venv>/bin/python test/test_rotary_gpu.py                    # pure GPU C rotary vs torch ref
+<venv>/bin/python test/test_rmsnorm_gpu.py                   # pure GPU C rmsnorm (+quant int8) vs torch
+<venv>/bin/python test/test_fp8_gpu.py                       # rmsnorm_quant_fp8 + dequant fp8/int8 transpose vs torch
 <venv>/bin/python cute/test_rotary.py                         # DSL jit vs torch + pure CUDA
 <venv>/bin/python cute/test_rotary.py --impl aot              # exported .o (load_module) instead
 <venv>/bin/python cute/test_rotary.py --impl aot --ref torch  # pick impl + reference

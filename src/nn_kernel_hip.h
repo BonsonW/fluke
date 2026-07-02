@@ -251,6 +251,128 @@ static __global__ void flstm_step(
     }
 }
 
+// ── fp8 E4M3FN software conversion (no hardware fp8 needed; matches PyTorch kFloat8_e4m3fn) ──
+// Convert E4M3FN fp8 byte to float32. NaN encodings 0x7F/0xFF -> 0.0f.
+static __device__ __forceinline__ float e4m3fn_to_float(uint8_t b) {
+    if ((b & 0x7F) == 0x7F) return 0.0f;
+    if ((b & 0x7F) == 0) return 0.0f;
+    uint8_t  sign = b >> 7;
+    uint8_t  exp  = (b >> 3) & 0xF;
+    uint8_t  mant = b & 0x7;
+    uint32_t f32_bits;
+    if (exp == 0) {
+        float val = (float)mant * 1.953125e-3f;  // denormal: mant * 2^(-9)
+        f32_bits = __float_as_uint(val) | ((uint32_t)sign << 31);
+    } else {
+        f32_bits = ((uint32_t)sign << 31)
+                 | ((uint32_t)(exp + 120) << 23)   // bias 7 -> 127
+                 | ((uint32_t)mant << 20);
+    }
+    return __uint_as_float(f32_bits);
+}
+
+// Convert float32 to E4M3FN fp8 byte. Values outside [-448,448] saturate; NaN never produced.
+static __device__ __forceinline__ uint8_t float_to_e4m3fn(float f) {
+    uint32_t bits     = __float_as_uint(f);
+    uint32_t sign     = bits >> 31;
+    uint32_t f32_exp  = (bits >> 23) & 0xFF;
+    uint32_t f32_mant = bits & 0x7FFFFF;
+    if (f32_exp == 0) return (uint8_t)(sign << 7);
+    int e4m3_exp = (int)f32_exp - 120;
+    if (e4m3_exp >= 16) return (uint8_t)((sign << 7) | 0x7E);
+    if (e4m3_exp > 0) {
+        uint32_t mant3 = (f32_mant + (1U << 19)) >> 20;
+        if (mant3 >= 8) { mant3 = 0; ++e4m3_exp; }
+        if (e4m3_exp >= 16) return (uint8_t)((sign << 7) | 0x7E);
+        if (e4m3_exp == 15 && mant3 == 7) mant3 = 6;  // avoid NaN encoding
+        return (uint8_t)((sign << 7) | ((uint32_t)e4m3_exp << 3) | mant3);
+    } else {
+        if (e4m3_exp <= -4) return (uint8_t)(sign << 7);
+        int shift = 21 - e4m3_exp;
+        uint32_t full = (1U << 23) | f32_mant;
+        uint32_t mant3 = (full + (1U << (shift - 1))) >> shift;
+        if (mant3 >= 8) return (uint8_t)((sign << 7) | (1U << 3));
+        return (uint8_t)((sign << 7) | mant3);
+    }
+}
+
+// Fused RMSNorm + fp8 E4M3FN quantize (in place). residual (fp8) / residual_scale (f32,
+// per-token) hold the previous quantized residual on entry; overwritten with the new one.
+// half2-vectorized; one block per row, blockDim.x == hidden_dim/2.
+static __global__ void rmsnorm_quant_fp8(
+    const half*  in,
+    const half*  weight,
+    uint8_t*     residual,
+    float*       residual_scale,
+    int          n_tokens,
+    int          hidden_dim,
+    float        alpha,
+    float        eps
+) {
+    int row = blockIdx.x;
+    int idx = threadIdx.x;
+    if (row >= n_tokens) return;
+
+    const half2* inp = reinterpret_cast<const half2*>(in + (int64_t)row * hidden_dim);
+    const half2* w2  = reinterpret_cast<const half2*>(weight);
+    uchar2*      res = reinterpret_cast<uchar2*>(residual + (int64_t)row * hidden_dim);
+    float*       res_scale = residual_scale + row;
+
+    __shared__ float warp_reduce_buf[64];
+
+    float2 wf = __half22float2(w2[idx]);
+    float rs = *res_scale;
+    uchar2 rq = res[idx];
+    float2 xf = __half22float2(inp[idx]);
+    float2 val = make_float2(xf.x + e4m3fn_to_float(rq.x) * rs * alpha,
+                             xf.y + e4m3fn_to_float(rq.y) * rs * alpha);
+
+    float sum_sq = block_reduce_sum(val.x * val.x + val.y * val.y, warp_reduce_buf);
+    float rms_inv = rsqrtf(sum_sq / hidden_dim + eps);
+    float2 normalized = make_float2(val.x * rms_inv * wf.x, val.y * rms_inv * wf.y);
+
+    float abs_max = block_reduce_max(fmaxf(fabsf(normalized.x), fabsf(normalized.y)), warp_reduce_buf);
+    float fp8_scale = fmaxf(abs_max, 1e-12f) / 448.0f;
+    if (idx == 0) *res_scale = fp8_scale;
+
+    uchar2 out;
+    out.x = float_to_e4m3fn(fmaxf(-448.0f, fminf(448.0f, normalized.x / fp8_scale)));
+    out.y = float_to_e4m3fn(fmaxf(-448.0f, fminf(448.0f, normalized.y / fp8_scale)));
+    res[idx] = out;
+}
+
+// Dequantize fp8 [n_timesteps, batch_size, n_channels] (× scalar scale) AND transpose to
+// f16 [batch_size, n_timesteps, n_channels] in one pass: out[n,t,c] = fp8(in[t,n,c]) * scale.
+// One block per (t,n) row, n_channels threads; reads/writes coalesced along c.
+static __global__ void dequant_fp8_transpose(
+    const uint8_t* in,
+    half*          out,
+    int n_timesteps, int batch_size, int n_channels, float scale
+) {
+    int tn = blockIdx.x;
+    int c  = threadIdx.x;
+    if (c >= n_channels) return;
+    int t = tn / batch_size;
+    int n = tn - t * batch_size;
+    float v = e4m3fn_to_float(in[(int64_t)tn * n_channels + c]) * scale;
+    out[(((int64_t)n * n_timesteps + t) * n_channels) + c] = __float2half(v);
+}
+
+// INT8 analogue of dequant_fp8_transpose: out[n,t,c] = (float)in_i8[t,n,c] * scale, to f16.
+static __global__ void dequant_int8_transpose(
+    const int8_t* in,
+    half*         out,
+    int n_timesteps, int batch_size, int n_channels, float scale
+) {
+    int tn = blockIdx.x;
+    int c  = threadIdx.x;
+    if (c >= n_channels) return;
+    int t = tn / batch_size;
+    int n = tn - t * batch_size;
+    float v = (float)in[(int64_t)tn * n_channels + c] * scale;
+    out[(((int64_t)n * n_timesteps + t) * n_channels) + c] = __float2half(v);
+}
+
 #ifdef __cplusplus
 }
 #endif

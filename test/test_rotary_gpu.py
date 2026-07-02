@@ -1,10 +1,10 @@
-"""Build-and-run test for the CUDA rotary embedding kernel.
+"""Build-and-run test for the GPU rotary embedding kernel.
 
 Builds lib/libfluke.so via `make` (fluke_lib) and calls the real fluke_rotary_emb_gpu
 through ctypes on q (chunk 0) and k (chunk 1) of a qkv tensor, then diffs against a
 torch reference -> PASS/FAIL. Also benchmarks with CUDA events.
 
-    ./pyvenv/bin/python test/test_rotary_cuda.py
+    ./pyvenv/bin/python test/test_rotary_gpu.py
 
 Requires a CUDA-enabled torch (see test/requirements.txt) and a CUDA toolkit.
 """
