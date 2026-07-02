@@ -100,6 +100,42 @@ void fluke_rmsnorm_quant_int8_gpu(
     float eps
 );
 
+// Fused RMSNorm + per-token fp8 (E4M3FN) quantize, in place. `residual` (fp8 bytes) and
+// `residual_scale` (f32, per-token) hold the previous quantized residual on entry; on return
+// the newly quantized rmsnorm(in + alpha*dequant(residual))*weight. Software fp8 (portable).
+void fluke_rmsnorm_quant_fp8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
+
+// Dequantize + transpose in one pass: in fp8 [n_timesteps, batch_size, n_channels] ->
+// out f16 [batch_size, n_timesteps, n_channels], out[n,t,c] = fp8(in[t,n,c]) * scale.
+void fluke_dequant_fp8_transpose_gpu(
+    const void* in,
+    void*       out,
+    int         n_timesteps,
+    int         batch_size,
+    int         n_channels,
+    float       scale
+);
+
+// INT8 analogue of fluke_dequant_fp8_transpose_gpu: in int8 [n_timesteps, batch_size, n_channels]
+// -> out f16 [batch_size, n_timesteps, n_channels], out[n,t,c] = (float)in[t,n,c] * scale.
+void fluke_dequant_int8_transpose_gpu(
+    const void* in,
+    void*       out,
+    int         n_timesteps,
+    int         batch_size,
+    int         n_channels,
+    float       scale
+);
+
 // See fluke_rotary_emb_cpu: sin_gpu/cos_gpu are [seq_len, sincos_width] (rotate-half),
 // rotating 2*sincos_width dims per head (require 2*sincos_width <= head_dim).
 void fluke_rotary_emb_gpu(

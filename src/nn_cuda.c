@@ -124,3 +124,63 @@ void fluke_flstm_step_gpu(
     );
     checkCudaError();
 }
+
+void fluke_rmsnorm_quant_fp8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+) {
+    ASSERT(hidden_dim <= 1024);
+    ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
+
+    int threads = hidden_dim / 2;
+    int blocks = n_tokens;
+
+    rmsnorm_quant_fp8<<<blocks, threads>>>(
+        (half *)in, (half *)weight, (uint8_t *)residual, (float *)residual_scale, n_tokens, hidden_dim, alpha, eps
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}
+
+void fluke_dequant_fp8_transpose_gpu(
+    const void* in,
+    void*       out,
+    int         n_timesteps,
+    int         batch_size,
+    int         n_channels,
+    float       scale
+) {
+    ASSERT(n_channels <= 1024);
+
+    dequant_fp8_transpose<<<n_timesteps * batch_size, n_channels>>>(
+        (const uint8_t *)in, (half *)out, n_timesteps, batch_size, n_channels, scale
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}
+
+void fluke_dequant_int8_transpose_gpu(
+    const void* in,
+    void*       out,
+    int         n_timesteps,
+    int         batch_size,
+    int         n_channels,
+    float       scale
+) {
+    ASSERT(n_channels <= 1024);
+
+    dequant_int8_transpose<<<n_timesteps * batch_size, n_channels>>>(
+        (const int8_t *)in, (half *)out, n_timesteps, batch_size, n_channels, scale
+    );
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}

@@ -1,10 +1,10 @@
-"""Build-and-run test for the CUDA RMSNorm kernels.
+"""Build-and-run test for the GPU RMSNorm kernels.
 
 Builds lib/libfluke.so via `make` (fluke_lib) and calls the real fluke_rmsnorm_gpu /
 fluke_rmsnorm_quant_int8_gpu through ctypes, diffing against a torch reference ->
 PASS/FAIL. Also benchmarks each with CUDA events.
 
-    ./pyvenv/bin/python test/test_rmsnorm_cuda.py
+    ./pyvenv/bin/python test/test_rmsnorm_gpu.py
 
 Requires a CUDA-enabled torch (see test/requirements.txt) and a CUDA toolkit.
 (The fp8 fused kernel is not implemented on CUDA, so it is not covered here.)

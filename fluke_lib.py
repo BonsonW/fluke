@@ -23,23 +23,29 @@ _SIGNATURES = {
     "fluke_silu_mul_gpu":          [_P, _P, _I, _I],
     "fluke_rmsnorm_gpu":           [_P, _P, _P, _P, _I, _I, _F, _F],
     "fluke_rmsnorm_quant_int8_gpu":[_P, _P, _P, _P, _I, _I, _F, _F],
+    "fluke_rmsnorm_quant_fp8_gpu": [_P, _P, _P, _P, _I, _I, _F, _F],
+    "fluke_dequant_fp8_transpose_gpu":  [_P, _P, _I, _I, _I, _F],
+    "fluke_dequant_int8_transpose_gpu": [_P, _P, _I, _I, _I, _F],
+    "fluke_flstm_step_gpu":        [_P, _P, _P, _P, _I, _I],
 }
 
 
 def _build():
-    """Build lib/libfluke.so for the current GPU. Picks the ROCm (HIP) or CUDA backend from the
-    torch build: ROCm torch presents as torch.cuda.* but sets torch.version.hip."""
+    """Build lib/libfluke.so for the current GPU backend (CUDA or HIP), matching the device arch.
+    ROCm torch presents as torch.cuda.* but sets torch.version.hip."""
     import torch
-    if getattr(torch.version, "hip", None):
-        gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]  # e.g. gfx1201
-        print(f">> building libfluke.so (make shared rocm=1, --offload-arch={gfx})")
-        subprocess.run(["make", "shared", "rocm=1", f"ROCM_ARCH=--offload-arch={gfx}"],
-                       cwd=_ROOT, check=True)
-    else:
+    if getattr(torch.version, "hip", None):  # ROCm/HIP torch
+        try:
+            gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]  # e.g. gfx1201
+        except Exception:
+            gfx = ""
+        cmd = ["make", "shared", "rocm=1"] + ([f"ROCM_ARCH=--offload-arch={gfx}"] if gfx else [])
+    else:  # CUDA torch
         cc = torch.cuda.get_device_capability()
-        arch = f"-gencode arch=compute_{cc[0]}{cc[1]},code=sm_{cc[0]}{cc[1]}"
-        print(f">> building libfluke.so (make shared cuda=1, {arch})")
-        subprocess.run(["make", "shared", "cuda=1", f"CUDA_ARCH={arch}"], cwd=_ROOT, check=True)
+        cmd = ["make", "shared", "cuda=1",
+               f"CUDA_ARCH=-gencode arch=compute_{cc[0]}{cc[1]},code=sm_{cc[0]}{cc[1]}"]
+    print(f">> building libfluke.so ({' '.join(cmd[1:])})")
+    subprocess.run(cmd, cwd=_ROOT, check=True)
 
 
 def load(rebuild=False):
