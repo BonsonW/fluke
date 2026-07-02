@@ -30,10 +30,11 @@ BN = 32
 NUM_STAGES = 3
 ATOM_LAYOUT = (2, 2, 1)
 
-# Exported .h/.o live in the top-level artifacts/ dir (shared across all kernels).
-# _HERE = cute/ampere/dual_gemm_silu  ->  fluke root is three parents up.
+# Exported .h/.o live in the top-level artifacts/<arch>/ dir (bundled into libfluke.a per
+# arch). Ampere compiles to sm80 cubins (also run on sm86/sm89). _HERE = cute/ampere/dual_gemm_silu.
+ARCH = "sm80"
 _FLUKE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
-ARTIFACTS_DIR = os.path.join(_FLUKE_ROOT, "artifacts")
+ARTIFACTS_DIR = os.path.join(_FLUKE_ROOT, "artifacts", ARCH)
 
 
 def _export_one(cfg, artifacts_dir):

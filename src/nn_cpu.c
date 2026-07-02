@@ -206,3 +206,80 @@ void fluke_rmsnorm_cpu(
         NEG_CHK(ret);
     }
 }
+
+// ── fLSTM step (fp32 CPU reference; single timestep) ──────────────────────────
+static float flstm_clamp(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+typedef struct {
+    const float *scratch;
+    const float *ih_t;
+    float *cell;
+    float *hh_next;
+    uint64_t start;
+    uint64_t end;
+    int gate_dim;
+    int hidden_dim;
+} flstm_thread_arg_t;
+
+static void* pthread_single_flstm(void* voidargs) {
+    flstm_thread_arg_t* a = (flstm_thread_arg_t*)voidargs;
+    for (uint64_t n = a->start; n < a->end; ++n) {
+        for (int ch = 0; ch < a->hidden_dim; ++ch) {
+            int base = (int)n * a->gate_dim + ch;
+            float gi = a->scratch[base + 0 * a->hidden_dim] + a->ih_t[base + 0 * a->hidden_dim];
+            float gf = a->scratch[base + 1 * a->hidden_dim] + a->ih_t[base + 1 * a->hidden_dim];
+            float gg = a->scratch[base + 2 * a->hidden_dim] + a->ih_t[base + 2 * a->hidden_dim];
+            float go = a->scratch[base + 3 * a->hidden_dim] + a->ih_t[base + 3 * a->hidden_dim];
+            float i_g = flstm_clamp(gi * 0.2f + 0.5f, 0.f, 1.f);
+            float f_g = flstm_clamp(gf * 0.2f + 0.5f, 0.f, 1.f);
+            float g_g = flstm_clamp(gg, -1.f, 1.f);
+            float o_g = flstm_clamp(go * 0.2f + 0.5f, 0.f, 1.f);
+            float c_new = f_g * a->cell[n * a->hidden_dim + ch] + i_g * g_g;
+            a->cell[n * a->hidden_dim + ch]    = c_new;
+            a->hh_next[n * a->hidden_dim + ch] = o_g * tanhf(c_new);
+        }
+    }
+    pthread_exit(0);
+}
+
+void fluke_flstm_step_cpu(
+    const void* scratch,
+    const void* ih_t,
+    void* cell,
+    void* hh_next,
+    int batch_size,
+    int hidden_dim,
+    int n_threads
+) {
+    n_threads = batch_size < n_threads ? batch_size : n_threads;
+    if (n_threads < 1) n_threads = 1;
+    const int chunks_per_thread = batch_size / n_threads;
+    const int num_threads_with_one_more_chunk = batch_size % n_threads;
+
+    pthread_t tids[n_threads];
+    flstm_thread_arg_t pt_args[n_threads];
+    int32_t t, ret;
+
+    for (t = 0; t < n_threads; t++) {
+        int extra = t < num_threads_with_one_more_chunk ? t : num_threads_with_one_more_chunk;
+        pt_args[t].start = t * chunks_per_thread + extra;
+        pt_args[t].end = pt_args[t].start + chunks_per_thread + (int)(t < num_threads_with_one_more_chunk);
+        pt_args[t].scratch = (const float *)scratch;
+        pt_args[t].ih_t = (const float *)ih_t;
+        pt_args[t].cell = (float *)cell;
+        pt_args[t].hh_next = (float *)hh_next;
+        pt_args[t].gate_dim = 4 * hidden_dim;
+        pt_args[t].hidden_dim = hidden_dim;
+    }
+
+    for (t = 0; t < n_threads; t++) {
+        ret = pthread_create(&tids[t], NULL, pthread_single_flstm, (void *)(&pt_args[t]));
+        NEG_CHK(ret);
+    }
+    for (t = 0; t < n_threads; t++) {
+        ret = pthread_join(tids[t], NULL);
+        NEG_CHK(ret);
+    }
+}

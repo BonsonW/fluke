@@ -54,6 +54,19 @@ void fluke_rmsnorm_cpu(
     int n_threads
 );
 
+// fLSTM step (single timestep, elementwise gate epilogue). scratch/ih_t are
+// [batch_size, 4*hidden_dim] gate pre-activations; cell [batch_size, hidden_dim] is updated
+// in place; hh_next [batch_size, hidden_dim] receives the new hidden state. fp32 CPU reference.
+void fluke_flstm_step_cpu(
+    const void* scratch,
+    const void* ih_t,
+    void* cell,
+    void* hh_next,
+    int batch_size,
+    int hidden_dim,
+    int n_threads
+);
+
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 // out = rmsnorm(in + alpha*residual) * weight. in/residual/weight/out are fp16
@@ -107,6 +120,56 @@ void fluke_silu_mul_gpu(
     void *out,
     int n_tokens,
     int hidden_dim
+);
+
+// fLSTM step (single timestep) on fp16. scratch/ih_t [batch_size, 4*hidden_dim];
+// cell [batch_size, hidden_dim] updated in place; hh_next [batch_size, hidden_dim] out.
+// No internal sync (called per-timestep in a loop; the caller syncs).
+void fluke_flstm_step_gpu(
+    const void* scratch,
+    const void* ih_t,
+    void* cell,
+    void* hh_next,
+    int batch_size,
+    int hidden_dim
+);
+
+// ── Fused INT8 DSL kernels (AOT-exported CuTe/Fly artifacts) ──────────────────
+// A stable, ATen-free C ABI over the arch-specialized fused kernels. The arch
+// detection, module load, and descriptor plumbing live inside fluke (src/fused_*.c);
+// consumers (e.g. slorado) just pass device pointers + dims. Only available where a
+// matching precompiled backend exists (CUDA >= 12 on a supported arch); otherwise
+// fluke_int8_select returns NULL and the caller keeps its fp16 path.
+
+// Model dimensions a backend must match (kernels are dimension-specialized).
+typedef struct { int d_model, dim_feedforward, nhead, head_dim, max_seq; } fluke_dims_t;
+
+// Opaque, process-lifetime backend handle. Loads the arch's kernel module(s) once.
+// Returns NULL if no precompiled backend matches this device's arch and `dims`.
+// The returned pointer is shared across callers and must NOT be freed.
+typedef struct fluke_int8_backend fluke_int8_backend_t;
+fluke_int8_backend_t *fluke_int8_select(int device_index, fluke_dims_t dims);
+
+// Fused int8 wqkv GEMM + rotary. a_i8: [M, d_model] int8 (+per-token scale_a). wqkv_i8:
+// [3*d_model, d_model] int8 (+per-out-channel scale_b). sin/cos: fp32 [seq, head_dim/2]
+// (rotate-half). out: fp16 [M, 3*d_model] (row-major, contiguous). seqlen = tokens/seq
+// (rotary indexes seq = row % seqlen). Returns 0 on success.
+int fluke_qkv_rotary_i8_gpu(
+    const fluke_int8_backend_t *b, void *out,
+    const void *a_i8, const void *wqkv_i8,
+    const void *scale_a, const void *scale_b,
+    const void *sin, const void *cos,
+    int M, int seqlen
+);
+
+// Fused int8 dual GEMM (gate, up) + SiLU. a_i8: [M, d_model] int8 (+per-token scale_a).
+// gate_i8/up_i8: [dim_feedforward, d_model] int8 (+per-out-channel scales). out: fp16
+// [M, dim_feedforward] = silu(gate) * up (row-major, contiguous). Returns 0 on success.
+int fluke_gated_mlp_i8_gpu(
+    const fluke_int8_backend_t *b, void *out,
+    const void *a_i8, const void *gate_i8, const void *up_i8,
+    const void *scale_a, const void *scale_gate, const void *scale_up,
+    int M
 );
 
 #endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)

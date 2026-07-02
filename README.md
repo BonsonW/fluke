@@ -70,6 +70,18 @@ pure CUDA C epilogue `fluke_silu_mul_gpu` (`src/nn_cuda.c`), tested by
 `cute/test_dual_gemm_silu.py` (`out = silu(A@Bg^T) * (A@Bu^T)`; jit/aot vs torch and/or
 the pure CUDA C `silu_mul`).
 
+The **factored LSTM** layer follows the same template but is two kernels (see slorado
+`CRFModel.cpp`): the down-projection (both the recurrent `hh_down` per-step and the input
+`x_down` precompute) is the plain INT8 GEMM (`gemm_i8_quant`, int8→f16); the fused step
+(`cute/ampere/factored_lstm/factored_lstm_i8.py`, `TensorOpFactoredLstmI8`) does two f16
+up-projections into four gate accumulators + gates + cell update + INT8 hidden output
+(fixed scale 1/127). Faithful to the RDNA fp8 original, only the down-projection and the
+h output are INT8; the up-projections stay f16 (via the plain f16 GEMM base
+`cute/ampere/gemm_f16.py`, `TensorOpGemm`, which the fused step inherits). Both kernels
+are exported by `cute/ampere/factored_lstm/export_factored_lstm_i8.py` (the fused step is
+K-merged: A = [hh_down | x_down], per-gate weight W_g = [up_hh_g | up_ih_g]). Tested by
+`cute/test_factored_lstm.py` (jit/aot vs torch; DSL-only, no pure-CUDA C ref).
+
 **RMSNorm** is pure C/CUDA only (no CuTe DSL): `fluke_rmsnorm_gpu` and the fused
 `fluke_rmsnorm_quant_int8_gpu` in `src/` (CUDA + HIP), with a fp32 CPU reference
 `fluke_rmsnorm_cpu` for the non-quant kernel only. Tested by `test/test_rmsnorm_cuda.py`
@@ -97,7 +109,9 @@ make                                                                 # CPU-only
 <venv>/bin/python cute/test_rotary.py --impl aot --ref torch  # pick impl + reference
 <venv>/bin/python cute/test_gemm.py                           # INT8 GEMM vs fp16 torch GEMM
 <venv>/bin/python cute/test_dual_gemm_silu.py                 # dual GEMM+SiLU: jit/aot vs torch + cuda C
+<venv>/bin/python cute/test_factored_lstm.py                 # factored-LSTM step: jit/aot vs torch
 <venv>/bin/python cute/ampere/rotary/export_gemm_i8_rotary.py # AOT export only (config inlined)
+<venv>/bin/python cute/ampere/factored_lstm/export_factored_lstm_i8.py # AOT export (step + int8 down-proj)
 ```
 
 ## Benchmark
@@ -109,4 +123,5 @@ reporting TOPS + effective bandwidth):
 <venv>/bin/python cute/bench_gemm.py                          # INT8 GEMM  (--M --N --K)
 <venv>/bin/python cute/bench_rotary.py                        # fused INT8 GEMM+rotary  (--M --K --nhead ...)
 <venv>/bin/python cute/bench_dual_gemm_silu.py                # fused dual INT8 GEMM+SiLU  (--M --N --K)
+<venv>/bin/python cute/bench_factored_lstm.py                # INT8 factored-LSTM per-step (down-proj + step)  (--B)
 ```

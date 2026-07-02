@@ -107,3 +107,20 @@ void fluke_rmsnorm_quant_int8_gpu(
     cudaDeviceSynchronize();
     checkCudaError();
 }
+
+void fluke_flstm_step_gpu(
+    const void* scratch,
+    const void* ih_t,
+    void* cell,
+    void* hh_next,
+    int batch_size,
+    int hidden_dim
+) {
+    int threads = (hidden_dim < 1024) ? hidden_dim : 1024;
+    flstm_step<<<batch_size, threads>>>(
+        (const half*)scratch, (const half*)ih_t,
+        (half*)cell, (half*)hh_next,
+        4 * hidden_dim, hidden_dim
+    );
+    checkCudaError();
+}
