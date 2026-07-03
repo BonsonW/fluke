@@ -27,6 +27,16 @@ static inline void gpuAssert(const char *file, int line){
    }
 }
 
+// Post-launch kernel error check. checkHipError() (= hipGetLastError()) is sync-free and catches
+// launch-config errors immediately; async execution errors are sticky and surface on the next HIP
+// call. In DEBUG builds we also hipDeviceSynchronize() so such an async error is pinpointed to THIS
+// kernel. Release builds never sync here (no per-kernel serialization).
+#ifdef DEBUG
+#define checkKernel() { checkHipError(); HIP_CHECK(hipDeviceSynchronize()); }
+#else
+#define checkKernel() { checkHipError(); }
+#endif
+
 // https://stackoverflow.com/questions/17399119/how-do-i-use-atomicmax-on-floating-point-values-in-cuda
 __device__ __forceinline__ static float atomicMaxFloat (float * addr, float value) {
     float old;

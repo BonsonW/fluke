@@ -22,8 +22,6 @@ void fluke_rotary_emb_gpu(
     int stride_seq,
     int stride_head
 ) {
-    hipError_t ret;
-
     int thread_h = 32;
     dim3 block_size(sincos_width, thread_h, 1);
 	dim3 grid_size(batch_size, n_heads, 1);
@@ -38,9 +36,7 @@ void fluke_rotary_emb_gpu(
         stride_head,
         sincos_width
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_silu_mul_gpu(
@@ -49,8 +45,6 @@ void fluke_silu_mul_gpu(
     int n_tokens,
     int hidden_dim
 ) {
-    hipError_t ret;
-
     int threads = 1024;
     int blocks = n_tokens;
 
@@ -60,9 +54,7 @@ void fluke_silu_mul_gpu(
         hidden_dim,
         n_tokens
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_rmsnorm_gpu(
@@ -75,7 +67,6 @@ void fluke_rmsnorm_gpu(
     float alpha,
     float eps
 ) {
-    hipError_t ret;
     ASSERT(hidden_dim <= 1024);
     ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
 
@@ -85,9 +76,7 @@ void fluke_rmsnorm_gpu(
     rmsnorm<<<blocks, threads>>>(
         (half *)in, (half *)residual, (half *)weight, (half *)out, n_tokens, hidden_dim, alpha, eps
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_rmsnorm_quant_int8_gpu(
@@ -100,7 +89,6 @@ void fluke_rmsnorm_quant_int8_gpu(
     float alpha,
     float eps
 ) {
-    hipError_t ret;
     ASSERT(hidden_dim <= 1024);
     ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
 
@@ -110,9 +98,7 @@ void fluke_rmsnorm_quant_int8_gpu(
     rmsnorm_quant_int8<<<blocks, threads>>>(
         (half *)in, (half *)weight, (int8_t *)residual, (float *)residual_scale, n_tokens, hidden_dim, alpha, eps
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_flstm_step_gpu(
@@ -129,7 +115,7 @@ void fluke_flstm_step_gpu(
         (half*)cell, (half*)hh_next,
         4 * hidden_dim, hidden_dim
     );
-    checkHipError();
+    checkKernel();
 }
 
 void fluke_rmsnorm_quant_fp8_gpu(
@@ -142,7 +128,6 @@ void fluke_rmsnorm_quant_fp8_gpu(
     float alpha,
     float eps
 ) {
-    hipError_t ret;
     ASSERT(hidden_dim <= 1024);
     ASSERT(hidden_dim % 2 == 0);  // kernel is half2-vectorized: one thread per adjacent pair
 
@@ -152,9 +137,7 @@ void fluke_rmsnorm_quant_fp8_gpu(
     rmsnorm_quant_fp8<<<blocks, threads>>>(
         (half *)in, (half *)weight, (uint8_t *)residual, (float *)residual_scale, n_tokens, hidden_dim, alpha, eps
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_dequant_fp8_transpose_gpu(
@@ -165,15 +148,12 @@ void fluke_dequant_fp8_transpose_gpu(
     int         n_channels,
     float       scale
 ) {
-    hipError_t ret;
     ASSERT(n_channels <= 1024);
 
     dequant_fp8_transpose<<<n_timesteps * batch_size, n_channels>>>(
         (const uint8_t *)in, (half *)out, n_timesteps, batch_size, n_channels, scale
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
 
 void fluke_dequant_int8_transpose_gpu(
@@ -184,13 +164,10 @@ void fluke_dequant_int8_transpose_gpu(
     int         n_channels,
     float       scale
 ) {
-    hipError_t ret;
     ASSERT(n_channels <= 1024);
 
     dequant_int8_transpose<<<n_timesteps * batch_size, n_channels>>>(
         (const int8_t *)in, (half *)out, n_timesteps, batch_size, n_channels, scale
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
+    checkKernel();
 }
