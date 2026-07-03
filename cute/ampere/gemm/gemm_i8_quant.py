@@ -38,6 +38,7 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
+import cuda.bindings.driver as cuda_driver  # cuda_driver.CUstream (AOT stream arg → CUDA-graph capture)
 
 def _install_local_mma_i8_op() -> None:
     if hasattr(cute.nvgpu.warp, "MmaI8Op"):
@@ -233,6 +234,8 @@ class TensorOpGemmI8:
         mScaleA: cute.Tensor,   # shape (M,) or (M, L), float32
         mScaleB: cute.Tensor,   # shape (N,) or (N, L), float32
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        stream: cuda_driver.CUstream = None,   # launch stream; None → default stream. AOT: pass a
+                                               # fake stream so the C wrapper gains a CUstream arg.
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
         self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
@@ -314,7 +317,7 @@ class TensorOpGemmI8:
             cute.size(grid_dim[2]),
         )
 
-        self.kernel(
+        _launcher = self.kernel(
             mA,
             mB,
             mC,
@@ -326,11 +329,15 @@ class TensorOpGemmI8:
             tiled_mma,
             raster_factor,
             epilogue_op,
-        ).launch(
+        )
+        launch_kwargs = dict(
             grid=rasterization_remap_grid_dim,
             block=[self.num_threads, 1, 1],
             smem=smem_size,
         )
+        if cutlass.const_expr(stream is not None):
+            launch_kwargs["stream"] = stream
+        _launcher.launch(**launch_kwargs)
 
     @cute.kernel
     def kernel(
@@ -825,6 +832,7 @@ def export_tensor_op_gemm_i8(
     n_size: int = 128,
     k_size: int = 128,
     l_size: int = 1,
+    with_stream: bool = False,
 ) -> None:
     """
     Export TensorOpGemmI8 kernel to C code with custom parameters.
@@ -898,6 +906,11 @@ def export_tensor_op_gemm_i8(
     print(f"  Tile: {bm}x{bn}x64, Atom layout: {atom_layout_mnk}")
     print(f"  Use K32: {use_k32}, Stages: {num_stages}")
     
+    # with_stream: trace a fake CUstream so the emitted C wrapper takes a trailing
+    # `CUstream stream` arg (lets the caller launch on a capturable stream / CUDA graph).
+    compile_kwargs = {}
+    if with_stream:
+        compile_kwargs["stream"] = cute.runtime.make_fake_stream()
     compiled_gemm = cute.compile(
         tensor_op_gemm,
         fake_a,
@@ -905,6 +918,7 @@ def export_tensor_op_gemm_i8(
         fake_c,
         fake_scale_a,
         fake_scale_b,
+        **compile_kwargs,
     )
     
     # Export to C code

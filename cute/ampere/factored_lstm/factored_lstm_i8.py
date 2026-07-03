@@ -37,6 +37,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
+import cuda.bindings.driver as cuda_driver  # cuda_driver.CUstream (AOT stream arg → CUDA-graph capture)
 
 from gemm_f16 import TensorOpGemm
 
@@ -94,6 +95,8 @@ class TensorOpFactoredLstmI8(TensorOpGemm):
         mBias_o: cute.Tensor,   # [H]      f32
         mC_c: cute.Tensor,      # [B, H]   f32   cell state, read + written in place
         mH_out: cute.Tensor,    # [B, H]   int8  hidden output (fixed scale 1/127)
+        stream: cuda_driver.CUstream = None,   # launch stream; None → default. AOT: pass a fake
+                                               # stream so the C wrapper gains a CUstream arg.
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
         self.b_major_mode = utils.LayoutEnum.from_tensor(mB_i)
@@ -146,18 +149,22 @@ class TensorOpFactoredLstmI8(TensorOpGemm):
             cute.size(grid_dim[2]),
         )
 
-        self.kernel(
+        _launcher = self.kernel(
             mA, mB_i, mB_f, mB_g, mB_o,
             mBias_i, mBias_f, mBias_g, mBias_o,
             mC_c, mH_out,
             sA_layout, sB_layout,
             tiled_copy_A, tiled_copy_B, tiled_mma,
             raster_factor,
-        ).launch(
+        )
+        launch_kwargs = dict(
             grid=rasterization_remap_grid_dim,
             block=[self.num_threads, 1, 1],
             smem=smem_size,
         )
+        if cutlass.const_expr(stream is not None):
+            launch_kwargs["stream"] = stream
+        _launcher.launch(**launch_kwargs)
 
     @cute.kernel
     def kernel(
@@ -528,9 +535,12 @@ def export_factored_lstm_i8(
     lstm = TensorOpFactoredLstmI8(ab_dtype, out_dtype, acc_dtype, atom_layout_mnk,
                                   bm=bm, bn=bn, bk=bk, num_stages=num_stages)
     print(f"Compiling TensorOpFactoredLstmI8  H={H} Kc={Kc}  tile={bm}x{bn}x{bk}  atom={atom_layout_mnk}")
+    # Trace a fake CUstream so the C wrapper takes a trailing `CUstream stream` arg
+    # (lets the caller launch on a capturable stream / CUDA graph).
     compiled = cute.compile(
         lstm, fake_a, fake_bi, fake_bf, fake_bg, fake_bo,
         fake_bias_i, fake_bias_f, fake_bias_g, fake_bias_o, fake_c, fake_h,
+        stream=cute.runtime.make_fake_stream(),
     )
     print(f"Exporting to {file_path}/{file_name}.h ...")
     compiled.export_to_c(file_path=file_path, file_name=file_name, function_prefix=function_prefix)

@@ -176,7 +176,7 @@ int fluke_down_proj_i8_gpu(
     const fluke_flstm_backend_t *b, void *out,
     const void *a_i8, const void *w_i8,
     const void *scale_a, const void *scale_b,
-    int M
+    int M, void *stream
 ) {
     const int H = b->H;   // contraction K
     const int R = b->R;   // output N
@@ -191,7 +191,7 @@ int fluke_down_proj_i8_gpu(
     down_proj_i8_R128_K1024_Tensor_mScaleB_t mScaleB; mScaleB.data = (void *)scale_b;
 
     return cute_dsl_down_proj_i8_R128_K1024_wrapper(
-        &g_down_proj_module, &mA, &mB, &mC, &mScaleA, &mScaleB);
+        &g_down_proj_module, &mA, &mB, &mC, &mScaleA, &mScaleB, (cudaStream_t)stream);
 }
 
 int fluke_flstm_step_i8_gpu(
@@ -199,7 +199,7 @@ int fluke_flstm_step_i8_gpu(
     const void *a_f16,
     const void *Bi, const void *Bf, const void *Bg, const void *Bo,
     const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
-    void *c_f32, int B
+    void *c_f32, int B, void *stream
 ) {
     const int H = b->H;
     const int Kc = b->K_hh + b->R;   // merged f16 up-proj contraction
@@ -220,7 +220,7 @@ int fluke_flstm_step_i8_gpu(
 
     return cute_dsl_factored_lstm_i8_H1024_Khh128_R128_wrapper(
         &g_lstm_step_module, &mA, &mB_i, &mB_f, &mB_g, &mB_o,
-        &mBias_i, &mBias_f, &mBias_g, &mBias_o, &mC_c, &mH_out);
+        &mBias_i, &mBias_f, &mBias_g, &mBias_o, &mC_c, &mH_out, (cudaStream_t)stream);
 }
 
 #else  // no CUDA-12 fused-kernel support — null backend; callers keep the fp16 path.
@@ -246,16 +246,16 @@ fluke_flstm_backend_t *fluke_flstm_select(int device_index, int H, int K_hh, int
     return NULL;
 }
 int fluke_down_proj_i8_gpu(const fluke_flstm_backend_t *b, void *out,
-    const void *a_i8, const void *w_i8, const void *scale_a, const void *scale_b, int M) {
-    (void)b;(void)out;(void)a_i8;(void)w_i8;(void)scale_a;(void)scale_b;(void)M;
+    const void *a_i8, const void *w_i8, const void *scale_a, const void *scale_b, int M, void *stream) {
+    (void)b;(void)out;(void)a_i8;(void)w_i8;(void)scale_a;(void)scale_b;(void)M;(void)stream;
     return -1;
 }
 int fluke_flstm_step_i8_gpu(const fluke_flstm_backend_t *b, void *h_i8,
     const void *a_f16, const void *Bi, const void *Bf, const void *Bg, const void *Bo,
     const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
-    void *c_f32, int B) {
+    void *c_f32, int B, void *stream) {
     (void)b;(void)h_i8;(void)a_f16;(void)Bi;(void)Bf;(void)Bg;(void)Bo;
-    (void)bias_i;(void)bias_f;(void)bias_g;(void)bias_o;(void)c_f32;(void)B;
+    (void)bias_i;(void)bias_f;(void)bias_g;(void)bias_o;(void)c_f32;(void)B;(void)stream;
     return -1;
 }
 

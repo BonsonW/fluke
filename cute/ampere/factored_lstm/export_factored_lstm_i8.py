@@ -69,6 +69,7 @@ def _export_down_proj_i8(cfg, artifacts_dir):
         file_path=artifacts_dir, file_name=name, function_prefix=name,
         use_k32=True, bm=DP_BM, bn=min(DP_BN, R), num_stages=DP_STAGES,
         m_size=cfg["B"], n_size=R, k_size=H,
+        with_stream=True,   # recurrent per-step GEMM → capturable stream for CUDA graphs
     )
 
 

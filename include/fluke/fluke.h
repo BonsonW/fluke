@@ -220,23 +220,27 @@ fluke_flstm_backend_t *fluke_flstm_select(int device_index, int H, int K_hh, int
 // int8 down-projection: out[M, R] f16 = (a_i8[M, H] * scale_a[M]) @ (w_i8[R, H] * scale_b[R])^T.
 // Projects hidden H -> rank R (the recurrent hh_down per step and the input x_down precompute).
 // a_i8 [M,H] int8 (+per-token scale_a[M]); w_i8 [R,H] int8 (+per-channel scale_b[R]). Returns 0 on success.
+// stream: the CUDA stream (cudaStream_t) to launch on; NULL uses the default stream. Passing the
+// capture stream lets this recurrent per-step kernel be captured into a CUDA graph.
 int fluke_down_proj_i8_gpu(
     const fluke_flstm_backend_t *b, void *out,
     const void *a_i8, const void *w_i8,
     const void *scale_a, const void *scale_b,
-    int M
+    int M, void *stream
 );
 
 // Fused factored-LSTM step. a_f16 [B, Kc] (Kc = K_hh + R; concat hh_down | x_down). Gate weights
 // Bi/Bf/Bg/Bo f16 [H, Kc] (concat up_hh_g | up_ih_g). biases bias_{i,f,g,o} f32 [H]. cell c_f32
 // [B, H] read + written in place. Output h_i8 [B, H] int8 (fixed scale 1/127). Does two f16
 // up-projections into 4 gate accumulators + gates + cell update. Returns 0 on success.
+// stream: the CUDA stream (cudaStream_t) to launch on; NULL uses the default stream. Passing the
+// capture stream lets this recurrent per-step kernel be captured into a CUDA graph.
 int fluke_flstm_step_i8_gpu(
     const fluke_flstm_backend_t *b, void *h_i8,
     const void *a_f16,
     const void *Bi, const void *Bf, const void *Bg, const void *Bo,
     const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
-    void *c_f32, int B
+    void *c_f32, int B, void *stream
 );
 
 // ── Fused FP8 DSL kernels (AOT-exported FlyDSL/RDNA artifacts) ────────────────
