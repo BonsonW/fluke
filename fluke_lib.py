@@ -22,6 +22,8 @@ _SIGNATURES = {
     "fluke_rotary_emb_gpu":        [_P, _P, _P, _I, _I, _I, _I, _I, _I, _I, _I],
     "fluke_silu_mul_gpu":          [_P, _P, _I, _I],
     "fluke_rmsnorm_gpu":           [_P, _P, _P, _P, _I, _I, _F, _F],
+    "fluke_quant_int8_gpu":        [_P, _P, _P, _I, _I],
+    "fluke_quant_fp8_gpu":         [_P, _P, _P, _I, _I],
     "fluke_rmsnorm_quant_int8_gpu":[_P, _P, _P, _P, _I, _I, _F, _F],
     "fluke_rmsnorm_quant_fp8_gpu": [_P, _P, _P, _P, _I, _I, _F, _F],
     "fluke_dequant_fp8_transpose_gpu":  [_P, _P, _I, _I, _I, _F],

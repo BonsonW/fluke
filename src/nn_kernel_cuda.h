@@ -344,6 +344,72 @@ static __global__ void rmsnorm_quant_fp8(
     res[idx] = out;
 }
 
+// ── Standalone per-token quantizers (no RMSNorm) ─────────────────────────────
+// f16 -> symmetric INT8, one scale per row (token). GPU analogue of quantize_tensor(x, dim=-1):
+// i_range = 128, quant_max = 127. scale[row] = max(amax, 1e-12)/128 is the DEQUANT multiplier
+// (reciprocal pre-applied, so fp ≈ out * scale); out = clamp(round(x / scale), -127, 127).
+// half2/char2-vectorized: one block per row, blockDim.x == hidden_dim/2.
+static __global__ void quant_int8(
+    const half* in,        // [n_tokens, hidden_dim] f16 input (row-major)
+    int8_t*     out,       // [n_tokens, hidden_dim] int8 output
+    float*      scale,     // [n_tokens]             per-token dequant scale output
+    int         n_tokens,
+    int         hidden_dim
+) {
+    int row = blockIdx.x;
+    int idx = threadIdx.x;   // owns adjacent pair (2*idx, 2*idx+1)
+    if (row >= n_tokens) return;
+
+    const half2* inp  = reinterpret_cast<const half2*>(in + (int64_t)row * hidden_dim);
+    char2*       outp = reinterpret_cast<char2*>(out + (int64_t)row * hidden_dim);
+
+    __shared__ float warp_reduce_buf[32];
+
+    float2 val = __half22float2(inp[idx]);
+    float abs_max = block_reduce_max(fmaxf(fabsf(val.x), fabsf(val.y)), warp_reduce_buf);
+
+    float int8_scale = fmaxf(abs_max, 1e-12f) / 128.0f;   // dequant multiplier (amax/128)
+    if (idx == 0) scale[row] = int8_scale;
+
+    float inv = 1.0f / int8_scale;                        // = 128/amax (quant multiplier)
+    char2 q;
+    q.x = (int8_t)max(-127, min(127, __float2int_rn(val.x * inv)));
+    q.y = (int8_t)max(-127, min(127, __float2int_rn(val.y * inv)));
+    outp[idx] = q;
+}
+
+// f16 -> fp8 E4M3FN, one scale per row (token). Standalone analogue of quant_int8, mirroring
+// rmsnorm_quant_fp8's conventions: scale[row] = max(amax, 1e-12)/448 (dequant multiplier);
+// out = float_to_e4m3fn(clamp(x / scale, -448, 448)). half2/uchar2-vectorized.
+static __global__ void quant_fp8(
+    const half* in,        // [n_tokens, hidden_dim] f16 input (row-major)
+    uint8_t*    out,       // [n_tokens, hidden_dim] fp8 E4M3FN output
+    float*      scale,     // [n_tokens]             per-token dequant scale output
+    int         n_tokens,
+    int         hidden_dim
+) {
+    int row = blockIdx.x;
+    int idx = threadIdx.x;
+    if (row >= n_tokens) return;
+
+    const half2* inp  = reinterpret_cast<const half2*>(in + (int64_t)row * hidden_dim);
+    uchar2*      outp = reinterpret_cast<uchar2*>(out + (int64_t)row * hidden_dim);
+
+    __shared__ float warp_reduce_buf[32];
+
+    float2 val = __half22float2(inp[idx]);
+    float abs_max = block_reduce_max(fmaxf(fabsf(val.x), fabsf(val.y)), warp_reduce_buf);
+
+    float fp8_scale = fmaxf(abs_max, 1e-12f) / 448.0f;
+    if (idx == 0) scale[row] = fp8_scale;
+
+    float inv = 1.0f / fp8_scale;
+    uchar2 o;
+    o.x = float_to_e4m3fn(fmaxf(-448.0f, fminf(448.0f, val.x * inv)));
+    o.y = float_to_e4m3fn(fmaxf(-448.0f, fminf(448.0f, val.y * inv)));
+    outp[idx] = o;
+}
+
 // Dequantize fp8 [n_timesteps, batch_size, n_channels] (× scalar scale) AND transpose to
 // f16 [batch_size, n_timesteps, n_channels] in one pass: out[n,t,c] = fp8(in[t,n,c]) * scale.
 // One block per (t,n) row, n_channels threads; reads/writes coalesced along c.

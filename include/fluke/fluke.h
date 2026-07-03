@@ -86,6 +86,28 @@ void fluke_rmsnorm_gpu(
     float eps
 );
 
+// Standalone per-token INT8 quantize (no RMSNorm). GPU analogue of quantize_tensor(x, dim=-1):
+// scale (f32 [n_tokens]) is the dequant multiplier amax/128 (reciprocal pre-applied, fp ≈ out*scale);
+// out (int8) = clamp(round(in / scale), -127, 127). hidden_dim must be even and <= 2048.
+void fluke_quant_int8_gpu(
+    const void* in,     /* f16  [n_tokens, hidden_dim] input  */
+    void*       out,    /* int8 [n_tokens, hidden_dim] output */
+    void*       scale,  /* f32  [n_tokens]             per-token dequant scale output */
+    int         n_tokens,
+    int         hidden_dim
+);
+
+// Standalone per-token fp8 (E4M3FN) quantize (no RMSNorm). scale (f32 [n_tokens]) = amax/448
+// (dequant multiplier); out (fp8 bytes) = float_to_e4m3fn(clamp(in / scale, -448, 448)). Software
+// fp8 (portable). hidden_dim must be even and <= 2048.
+void fluke_quant_fp8_gpu(
+    const void* in,     /* f16  [n_tokens, hidden_dim] input  */
+    void*       out,    /* uint8[n_tokens, hidden_dim] E4M3FN output */
+    void*       scale,  /* f32  [n_tokens]             per-token dequant scale output */
+    int         n_tokens,
+    int         hidden_dim
+);
+
 // Fused RMSNorm + per-token INT8 quantize, in place. `residual` (int8) and
 // `residual_scale` (f32, per-token) hold the previous quantized residual on entry;
 // on return they hold the newly quantized rmsnorm(in + alpha*dequant(residual))*weight.

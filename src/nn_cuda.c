@@ -170,3 +170,35 @@ void fluke_dequant_int8_transpose_gpu(
     );
     checkKernel();
 }
+
+void fluke_quant_int8_gpu(
+    const void* in,
+    void*       out,
+    void*       scale,
+    int         n_tokens,
+    int         hidden_dim
+) {
+    ASSERT(hidden_dim <= 2048);
+    ASSERT(hidden_dim % 2 == 0);  // half2/char2-vectorized: one thread per adjacent pair
+
+    quant_int8<<<n_tokens, hidden_dim / 2>>>(
+        (const half *)in, (int8_t *)out, (float *)scale, n_tokens, hidden_dim
+    );
+    checkKernel();
+}
+
+void fluke_quant_fp8_gpu(
+    const void* in,
+    void*       out,
+    void*       scale,
+    int         n_tokens,
+    int         hidden_dim
+) {
+    ASSERT(hidden_dim <= 2048);
+    ASSERT(hidden_dim % 2 == 0);  // half2/uchar2-vectorized: one thread per adjacent pair
+
+    quant_fp8<<<n_tokens, hidden_dim / 2>>>(
+        (const half *)in, (uint8_t *)out, (float *)scale, n_tokens, hidden_dim
+    );
+    checkKernel();
+}
