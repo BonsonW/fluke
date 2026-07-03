@@ -48,6 +48,18 @@ def import_impl(arch, subdir, module):
     return importlib.import_module(module)
 
 
+def warm_gpu(call, seconds=1.5):
+    """Spin `call` until the GPU clocks are warm — a cold clock badly skews benchmarks."""
+    start = torch.cuda.Event(enable_timing=True); stop = torch.cuda.Event(enable_timing=True)
+    start.record()
+    while True:
+        for _ in range(20):
+            call()
+        stop.record(); torch.cuda.synchronize()
+        if start.elapsed_time(stop) >= seconds * 1000:
+            break
+
+
 def quantize_tensor(t, dim=-1):
     """Symmetric per-row (dim=-1) int8 quantization. Returns (int8, dequant scale)."""
     qm = 127

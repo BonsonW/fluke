@@ -93,10 +93,20 @@ ifdef debug
 	CFLAGS += -fopenmp
 endif
 
-.PHONY: all shared fp8_shared clean distclean
+.PHONY: all shared fp8_shared clean distclean test-flstm-graph
 
 all: $(STATICLIB)
 shared: $(SHAREDLIB)
+
+# CUDA-graph capture-safety regression for the int8 factored-LSTM kernels: builds a C++ driver
+# against libfluke.a and requires bit-identical output eager vs captured-and-replayed. CUDA only
+# (uses cudaGraph + the sm80 int8 backend). Run:
+#   make cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80" test-flstm-graph
+$(BUILD_DIR)/test_flstm_graph_gpu: test/test_flstm_graph_gpu.cu $(STATICLIB) | $(BUILD_DIR)
+	$(NVCC) -O2 -std=c++17 $(CUDA_ARCH) -DHAVE_CUDA=1 -I include $< $(STATICLIB) \
+	    -L$(CUDA_LIB) -lcudart -lcuda -o $@
+test-flstm-graph: $(BUILD_DIR)/test_flstm_graph_gpu
+	$(BUILD_DIR)/test_flstm_graph_gpu
 
 # fp8 fused ABI as a standalone .so for the ctypes-based fly/ tests (rocm=1 only). Bundles the
 # fp8 dispatch + the embedded per-arch HSACOs; loaded by fly/test_*.py to exercise the real

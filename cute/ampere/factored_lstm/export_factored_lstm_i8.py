@@ -33,6 +33,10 @@ CONFIG = dict(H=1024, K_hh=128, R=128, B=128)
 
 # Tiling / scheduling knobs.
 # Fused step: 4 gate accumulators (i/f/g/o) -> keep bN small. K-merged f16 up-proj.
+# A100 sweep 2026-07 (cute/autotune_factored_lstm.py, 22 configs x B in 128..1024):
+# this config is best or within 2% at every B — the kernel is per-CTA latency-bound
+# (B=128: 12.2us, B=256: 13.3us, one CTA wave ~12us), so tiling can't move it further;
+# gains beyond this need structural changes, not knobs.
 LSTM_BM, LSTM_BN, LSTM_BK, LSTM_STAGES = 64, 32, 32, 3
 LSTM_ATOM = (2, 2, 1)
 # int8 down-proj: N=R=128 (one N tile), small-M friendly bm.

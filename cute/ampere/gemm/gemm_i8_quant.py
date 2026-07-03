@@ -231,11 +231,12 @@ class TensorOpGemmI8:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
-        mScaleA: cute.Tensor,   # shape (M,) or (M, L), float32
-        mScaleB: cute.Tensor,   # shape (N,) or (N, L), float32
+        mScaleA: cute.Tensor = None,   # shape (M,) or (M, L), float32; None when const_scale_a is set
+        mScaleB: cute.Tensor = None,   # shape (N,) or (N, L), float32
         epilogue_op: cutlass.Constexpr = lambda x: x,
         stream: cuda_driver.CUstream = None,   # launch stream; None → default stream. AOT: pass a
                                                # fake stream so the C wrapper gains a CUstream arg.
+        const_scale_a: cutlass.Constexpr = None,   # compile-time scale_a (e.g. 1/127); replaces mScaleA
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
         self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
@@ -329,6 +330,7 @@ class TensorOpGemmI8:
             tiled_mma,
             raster_factor,
             epilogue_op,
+            const_scale_a,
         )
         launch_kwargs = dict(
             grid=rasterization_remap_grid_dim,
@@ -354,6 +356,7 @@ class TensorOpGemmI8:
         tiled_mma: cute.TiledMma,
         rasterization_factor: cutlass.Int32,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        const_scale_a: cutlass.Constexpr = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -392,11 +395,12 @@ class TensorOpGemmI8:
             )
 
             # gScaleA: (BLK_M,)  — the M-slice this CTA owns
-            gScaleA = cute.local_tile(
-                mScaleA[None, bidz],
-                tiler=(self.bM,),
-                coord=(offset_tile_x,),
-            )
+            if cutlass.const_expr(const_scale_a is None):
+                gScaleA = cute.local_tile(
+                    mScaleA[None, bidz],
+                    tiler=(self.bM,),
+                    coord=(offset_tile_x,),
+                )
             # gScaleB: (BLK_N,)
             gScaleB = cute.local_tile(
                 mScaleB[None, bidz],
@@ -561,25 +565,13 @@ class TensorOpGemmI8:
             num_mma_n = cute.size(tCrC, mode=[2])
             # Build broadcast layouts: scale_A broadcasts across N (stride-0 in N)
             #                          scale_B broadcasts across M (stride-0 in M)
-            gScaleA_2d = cute.make_tensor(
-                gScaleA.iterator,
-                cute.make_layout((self.bM, self.bN), stride=(1, 0))
-            )
             gScaleB_2d = cute.make_tensor(
                 gScaleB.iterator,
                 cute.make_layout((self.bM, self.bN), stride=(0, 1))
             )
             # Partition through the same MMA thread map as C — automatically correct
-            tCgScaleA = thr_mma.partition_C(gScaleA_2d)  # (MMA_VAL, MMA_M, MMA_N)
             tCgScaleB = thr_mma.partition_C(gScaleB_2d)  # (MMA_VAL, MMA_M, MMA_N)
-            # Compact register storage: A only varies in M, B only varies in N
-            rScaleA = cute.make_rmem_tensor(
-                cute.make_layout(
-                    (num_vals, num_mma_m, num_mma_n),
-                    stride=(num_mma_m, 1, 0),   # stride-0 in N
-                ),
-                cutlass.Float32,
-            )
+            # Compact register storage: B only varies in N
             rScaleB = cute.make_rmem_tensor(
                 cute.make_layout(
                     (num_vals, num_mma_m, num_mma_n),
@@ -588,26 +580,50 @@ class TensorOpGemmI8:
                 cutlass.Float32,
             )
 
-            # Load only unique values — (num_vals * num_mma_m) + (num_vals * num_mma_n) loads
-            for i in cutlass.range(num_vals, unroll_full=True):
-                for m in cutlass.range(num_mma_m, unroll_full=True):
-                    rScaleA[i, m, 0] = tCgScaleA[i, m, 0].to(cutlass.Float32)
-            for i in cutlass.range(num_vals, unroll_full=True):
-                for n in cutlass.range(num_mma_n, unroll_full=True):
-                    rScaleB[i, 0, n] = tCgScaleB[i, 0, n].to(cutlass.Float32)
+            if cutlass.const_expr(const_scale_a is None):
+                gScaleA_2d = cute.make_tensor(
+                    gScaleA.iterator,
+                    cute.make_layout((self.bM, self.bN), stride=(1, 0))
+                )
+                tCgScaleA = thr_mma.partition_C(gScaleA_2d)  # (MMA_VAL, MMA_M, MMA_N)
+                # Compact register storage: A only varies in M
+                rScaleA = cute.make_rmem_tensor(
+                    cute.make_layout(
+                        (num_vals, num_mma_m, num_mma_n),
+                        stride=(num_mma_m, 1, 0),   # stride-0 in N
+                    ),
+                    cutlass.Float32,
+                )
 
-            # Precompute combined scale
-            rScale = cute.make_rmem_tensor(
-                cute.make_layout(
-                    (num_vals, num_mma_m, num_mma_n),
-                    stride=(num_mma_m * num_mma_n, num_mma_n, 1),
-                ),
-                cutlass.Float32,
-            )
-            for i in cutlass.range(num_vals, unroll_full=True):
-                for m in cutlass.range(num_mma_m, unroll_full=True):
+                # Load only unique values — (num_vals * num_mma_m) + (num_vals * num_mma_n) loads
+                for i in cutlass.range(num_vals, unroll_full=True):
+                    for m in cutlass.range(num_mma_m, unroll_full=True):
+                        rScaleA[i, m, 0] = tCgScaleA[i, m, 0].to(cutlass.Float32)
+                for i in cutlass.range(num_vals, unroll_full=True):
                     for n in cutlass.range(num_mma_n, unroll_full=True):
-                        rScale[i, m, n] = rScaleA[i, m, 0] * rScaleB[i, 0, n]
+                        rScaleB[i, 0, n] = tCgScaleB[i, 0, n].to(cutlass.Float32)
+
+                # Precompute combined scale
+                rScale = cute.make_rmem_tensor(
+                    cute.make_layout(
+                        (num_vals, num_mma_m, num_mma_n),
+                        stride=(num_mma_m * num_mma_n, num_mma_n, 1),
+                    ),
+                    cutlass.Float32,
+                )
+                for i in cutlass.range(num_vals, unroll_full=True):
+                    for m in cutlass.range(num_mma_m, unroll_full=True):
+                        for n in cutlass.range(num_mma_n, unroll_full=True):
+                            rScale[i, m, n] = rScaleA[i, m, 0] * rScaleB[i, 0, n]
+            else:
+                # scale_a is a compile-time constant: no gmem loads for scale_a, no
+                # rScaleA fragment, no dense combined-scale fragment. Fold the constant
+                # into rScaleB at load time and let the epilogue index it via its
+                # stride-0-in-M broadcast layout.
+                for i in cutlass.range(num_vals, unroll_full=True):
+                    for n in cutlass.range(num_mma_n, unroll_full=True):
+                        rScaleB[i, 0, n] = tCgScaleB[i, 0, n].to(cutlass.Float32) * const_scale_a
+                rScale = rScaleB
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling (shared memory -> registers)
