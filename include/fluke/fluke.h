@@ -265,6 +265,28 @@ int fluke_flstm_step_i8_gpu(
     void *c_f32, int B, void *stream
 );
 
+// Single-launch fused factored-LSTM step: does the recurrent int8 hh down-projection AND
+// the gate step in ONE kernel (removes the inter-kernel launch/DRAM round-trip; ~1.3-1.6x
+// over the down_proj + step pair on A100). Replaces fluke_down_proj_i8_gpu (hh) +
+// fluke_flstm_step_i8_gpu for the per-step recurrence only (the ih precompute still uses
+// fluke_down_proj_i8_gpu).
+//   h_prev_i8 [B, H] int8 (fixed 1/127); w_dn_i8 [K_hh, H] int8 recurrent down-weight;
+//   comb_scale [K_hh] f32 = per-channel w_dn scale * (1/127), host-folded;
+//   x_f16 [B, R] f16 = this step's x_down slice;
+//   Bi/Bf/Bg/Bo f16 [H, Kc], bias_{i,f,g,o} f32 [H]; c_f32 [B, H] updated in place;
+//   h_i8 [B, H] int8 out (1/127); hh_stage f16 [B, K_hh] scratch (producer-written, no init);
+//   flags int32 [ceil(B/64)*4] zeroed at allocation (self-cleaning across steps).
+// RESIDENCY: the whole grid must be co-resident (consumers spin on same-grid producers).
+// At the baked tile config that means B <= 512; the caller MUST fall back to the two-kernel
+// path for larger B. Returns 0 on success. stream as above (CUDA-graph capturable).
+int fluke_flstm_fused_step_i8_gpu(
+    const fluke_flstm_backend_t *b, void *h_i8,
+    const void *h_prev_i8, const void *w_dn_i8, const void *comb_scale, const void *x_f16,
+    const void *Bi, const void *Bf, const void *Bg, const void *Bo,
+    const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
+    void *c_f32, void *hh_stage, void *flags, int B, void *stream
+);
+
 // ── Fused FP8 DSL kernels (AOT-exported FlyDSL/RDNA artifacts) ────────────────
 // The AMD/RDNA counterpart of the int8 ABI above. Same fused ops, but inputs are
 // fp8 (e4m3) with the fp8 amax/448 scale convention instead of int8 amax/127, run on

@@ -24,6 +24,7 @@
 #include "artifacts/sm80/gemm_i8_rotary_N1536_K512_H8D64R64S2048.h"
 #include "artifacts/sm80/gemm_i8_dual_silu_N2048_K512.h"
 #include "artifacts/sm80/factored_lstm_i8_H1024_Khh128_R128.h"
+#include "artifacts/sm80/factored_lstm_fused_i8_H1024_Khh128_R128.h"
 #include "artifacts/sm80/down_proj_i8_R128_K1024.h"
 
 // Baked kernel dims (shared with the HIP backend — model-specific, not arch-specific).
@@ -140,8 +141,9 @@ struct fluke_flstm_backend {
     int cc;
 };
 
-static factored_lstm_i8_H1024_Khh128_R128_Kernel_Module_t g_lstm_step_module;
-static down_proj_i8_R128_K1024_Kernel_Module_t            g_down_proj_module;
+static factored_lstm_i8_H1024_Khh128_R128_Kernel_Module_t       g_lstm_step_module;
+static factored_lstm_fused_i8_H1024_Khh128_R128_Kernel_Module_t g_lstm_fused_module;
+static down_proj_i8_R128_K1024_Kernel_Module_t                  g_down_proj_module;
 static int g_lstm_loaded = 0;
 
 fluke_flstm_backend_t *fluke_flstm_select(int device_index, int H, int K_hh, int R) {
@@ -163,6 +165,7 @@ fluke_flstm_backend_t *fluke_flstm_select(int device_index, int H, int K_hh, int
     }
     if (!g_lstm_loaded) {
         factored_lstm_i8_H1024_Khh128_R128_Kernel_Module_Load(&g_lstm_step_module);
+        factored_lstm_fused_i8_H1024_Khh128_R128_Kernel_Module_Load(&g_lstm_fused_module);
         down_proj_i8_R128_K1024_Kernel_Module_Load(&g_down_proj_module);
         g_lstm_loaded = 1;
         fprintf(stderr, "[fluke] int8 factored-LSTM backend active on device %d (sm_%d)\n", device_index, cc);
@@ -223,6 +226,43 @@ int fluke_flstm_step_i8_gpu(
         &mBias_i, &mBias_f, &mBias_g, &mBias_o, &mC_c, &mH_out, (cudaStream_t)stream);
 }
 
+int fluke_flstm_fused_step_i8_gpu(
+    const fluke_flstm_backend_t *b, void *h_i8,
+    const void *h_prev_i8, const void *w_dn_i8, const void *comb_scale, const void *x_f16,
+    const void *Bi, const void *Bf, const void *Bg, const void *Bo,
+    const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
+    void *c_f32, void *hh_stage, void *flags, int B, void *stream
+) {
+    const int H = b->H;
+    const int K_hh = b->K_hh;
+    const int R = b->R;
+    const int Kc = K_hh + R;
+    #define FF_(s) factored_lstm_fused_i8_H1024_Khh128_R128_Tensor_##s
+
+    FF_(mHprev_t)  mHprev;  mHprev.data = (void *)h_prev_i8; fill_desc2d(mHprev.dynamic_shapes, mHprev.dynamic_strides, B, H);
+    FF_(mWdn_t)    mWdn;    mWdn.data   = (void *)w_dn_i8;   fill_desc2d(mWdn.dynamic_shapes,   mWdn.dynamic_strides,   K_hh, H);
+    FF_(mWdnScale_t) mWdnScale; mWdnScale.data = (void *)comb_scale;
+    FF_(mX_t)      mX;      mX.data     = (void *)x_f16;     fill_desc2d(mX.dynamic_shapes,     mX.dynamic_strides,     B, R);
+    FF_(mB_i_t) mB_i; mB_i.data = (void *)Bi; fill_desc2d(mB_i.dynamic_shapes, mB_i.dynamic_strides, H, Kc);
+    FF_(mB_f_t) mB_f; mB_f.data = (void *)Bf; fill_desc2d(mB_f.dynamic_shapes, mB_f.dynamic_strides, H, Kc);
+    FF_(mB_g_t) mB_g; mB_g.data = (void *)Bg; fill_desc2d(mB_g.dynamic_shapes, mB_g.dynamic_strides, H, Kc);
+    FF_(mB_o_t) mB_o; mB_o.data = (void *)Bo; fill_desc2d(mB_o.dynamic_shapes, mB_o.dynamic_strides, H, Kc);
+    FF_(mBias_i_t) mBias_i; mBias_i.data = (void *)bias_i;
+    FF_(mBias_f_t) mBias_f; mBias_f.data = (void *)bias_f;
+    FF_(mBias_g_t) mBias_g; mBias_g.data = (void *)bias_g;
+    FF_(mBias_o_t) mBias_o; mBias_o.data = (void *)bias_o;
+    FF_(mC_c_t)   mC_c;   mC_c.data   = c_f32;     fill_desc2d(mC_c.dynamic_shapes,   mC_c.dynamic_strides,   B, H);
+    FF_(mH_out_t) mH_out; mH_out.data = h_i8;      fill_desc2d(mH_out.dynamic_shapes, mH_out.dynamic_strides, B, H);
+    FF_(mHH_t)    mHH;    mHH.data    = hh_stage;  fill_desc2d(mHH.dynamic_shapes,    mHH.dynamic_strides,    B, K_hh);
+    FF_(mFlags_t) mFlags; mFlags.data = flags;
+    #undef FF_
+
+    return cute_dsl_factored_lstm_fused_i8_H1024_Khh128_R128_wrapper(
+        &g_lstm_fused_module, &mHprev, &mWdn, &mWdnScale, &mX,
+        &mB_i, &mB_f, &mB_g, &mB_o, &mBias_i, &mBias_f, &mBias_g, &mBias_o,
+        &mC_c, &mH_out, &mHH, &mFlags, (cudaStream_t)stream);
+}
+
 #else  // no CUDA-12 fused-kernel support — null backend; callers keep the fp16 path.
 
 fluke_int8_backend_t *fluke_int8_select(int device_index, fluke_dims_t dims) {
@@ -256,6 +296,16 @@ int fluke_flstm_step_i8_gpu(const fluke_flstm_backend_t *b, void *h_i8,
     void *c_f32, int B, void *stream) {
     (void)b;(void)h_i8;(void)a_f16;(void)Bi;(void)Bf;(void)Bg;(void)Bo;
     (void)bias_i;(void)bias_f;(void)bias_g;(void)bias_o;(void)c_f32;(void)B;(void)stream;
+    return -1;
+}
+int fluke_flstm_fused_step_i8_gpu(const fluke_flstm_backend_t *b, void *h_i8,
+    const void *h_prev_i8, const void *w_dn_i8, const void *comb_scale, const void *x_f16,
+    const void *Bi, const void *Bf, const void *Bg, const void *Bo,
+    const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
+    void *c_f32, void *hh_stage, void *flags, int B, void *stream) {
+    (void)b;(void)h_i8;(void)h_prev_i8;(void)w_dn_i8;(void)comb_scale;(void)x_f16;
+    (void)Bi;(void)Bf;(void)Bg;(void)Bo;(void)bias_i;(void)bias_f;(void)bias_g;(void)bias_o;
+    (void)c_f32;(void)hh_stage;(void)flags;(void)B;(void)stream;
     return -1;
 }
 

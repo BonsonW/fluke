@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "gemm"))  # shared base 
 
 import cutlass
 from factored_lstm_i8 import export_factored_lstm_i8
+from factored_lstm_fused_i8 import export_factored_lstm_fused_i8
 from gemm_i8_quant import export_tensor_op_gemm_i8
 
 # ── export configuration ──────────────────────────────────────────────────────
@@ -42,6 +43,9 @@ LSTM_ATOM = (2, 2, 1)
 # int8 down-proj: N=R=128 (one N tile), small-M friendly bm.
 DP_BM, DP_BN, DP_STAGES = 64, 128, 3
 DP_ATOM = (2, 2, 1)
+# Fused single-launch step (down-proj + gates). Shares the step tile config; S producer
+# CTAs per row-group each own K_hh/S hh_down columns. Residency bound: keep N <= 512.
+FUSED_S = 4
 
 # Exported .h/.o live in the top-level artifacts/<arch>/ (bundled into libfluke per arch).
 # Ampere compiles to sm80 cubins (also run on sm86/sm89). _HERE = cute/ampere/factored_lstm.
@@ -77,9 +81,22 @@ def _export_down_proj_i8(cfg, artifacts_dir):
     )
 
 
+def _export_fused_step(cfg, artifacts_dir):
+    H, K_hh, R = cfg["H"], cfg["K_hh"], cfg["R"]
+    name = f"factored_lstm_fused_i8_H{H}_Khh{K_hh}_R{R}"
+    print(f"\n[fused single-launch step  H={H} K_hh={K_hh} R={R} S={FUSED_S}]  -> {name}.h")
+    export_factored_lstm_fused_i8(
+        atom_layout_mnk=LSTM_ATOM,
+        file_path=artifacts_dir, file_name=name, function_prefix=name,
+        H=H, K_hh=K_hh, R=R, num_producers=FUSED_S,
+        bm=LSTM_BM, bn=LSTM_BN, bk=LSTM_BK, num_stages=LSTM_STAGES, b_size=cfg["B"],
+    )
+
+
 def _export_all(cfg, artifacts_dir):
     _export_step(cfg, artifacts_dir)
     _export_down_proj_i8(cfg, artifacts_dir)
+    _export_fused_step(cfg, artifacts_dir)
 
 
 if __name__ == "__main__":

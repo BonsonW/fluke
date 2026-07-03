@@ -58,6 +58,7 @@ ifdef cuda
         AOT_OBJ = $(BUILD_DIR)/gemm_i8_rotary_N1536_K512_H8D64R64S2048.o \
                   $(BUILD_DIR)/gemm_i8_dual_silu_N2048_K512.o \
                   $(BUILD_DIR)/factored_lstm_i8_H1024_Khh128_R128.o \
+                  $(BUILD_DIR)/factored_lstm_fused_i8_H1024_Khh128_R128.o \
                   $(BUILD_DIR)/down_proj_i8_R128_K1024.o
     endif
 # make rocm=1 builds the HIP backend (hipcc). Set ROCM_ARCH, e.g.
