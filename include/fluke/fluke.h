@@ -209,6 +209,36 @@ int fluke_gated_mlp_i8_gpu(
     int M
 );
 
+// ── Factored-LSTM (CRF/LSTM model) int8 kernels ───────────────────────────────
+// The CRF/LSTM basecaller path (slorado lstm_model.cpp), a separate model shape from the
+// transformer dims above: the int8 down-projection GEMM + the fused factored-LSTM step.
+// Selected on the LSTM shape (H/K_hh/R); NULL if the arch/shape don't match the precompiled
+// kernels (caller keeps its fp16 path). The handle is process-lifetime; do NOT free.
+typedef struct fluke_flstm_backend fluke_flstm_backend_t;
+fluke_flstm_backend_t *fluke_flstm_select(int device_index, int H, int K_hh, int R);
+
+// int8 down-projection: out[M, R] f16 = (a_i8[M, H] * scale_a[M]) @ (w_i8[R, H] * scale_b[R])^T.
+// Projects hidden H -> rank R (the recurrent hh_down per step and the input x_down precompute).
+// a_i8 [M,H] int8 (+per-token scale_a[M]); w_i8 [R,H] int8 (+per-channel scale_b[R]). Returns 0 on success.
+int fluke_down_proj_i8_gpu(
+    const fluke_flstm_backend_t *b, void *out,
+    const void *a_i8, const void *w_i8,
+    const void *scale_a, const void *scale_b,
+    int M
+);
+
+// Fused factored-LSTM step. a_f16 [B, Kc] (Kc = K_hh + R; concat hh_down | x_down). Gate weights
+// Bi/Bf/Bg/Bo f16 [H, Kc] (concat up_hh_g | up_ih_g). biases bias_{i,f,g,o} f32 [H]. cell c_f32
+// [B, H] read + written in place. Output h_i8 [B, H] int8 (fixed scale 1/127). Does two f16
+// up-projections into 4 gate accumulators + gates + cell update. Returns 0 on success.
+int fluke_flstm_step_i8_gpu(
+    const fluke_flstm_backend_t *b, void *h_i8,
+    const void *a_f16,
+    const void *Bi, const void *Bf, const void *Bg, const void *Bo,
+    const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
+    void *c_f32, int B
+);
+
 // ── Fused FP8 DSL kernels (AOT-exported FlyDSL/RDNA artifacts) ────────────────
 // The AMD/RDNA counterpart of the int8 ABI above. Same fused ops, but inputs are
 // fp8 (e4m3) with the fp8 amax/448 scale convention instead of int8 amax/127, run on

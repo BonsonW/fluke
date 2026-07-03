@@ -10,4 +10,10 @@
 #define FLUKE_SUP_NHEAD     8
 #define FLUKE_SUP_HEAD_DIM  64
 
+// Factored-LSTM (CRF/LSTM basecaller) shape. H = hidden, K_hh = hidden rank, R = input rank;
+// Kc = K_hh + R is the merged f16 up-projection contraction.
+#define FLUKE_LSTM_H        1024
+#define FLUKE_LSTM_K_HH     128
+#define FLUKE_LSTM_R        128
+
 #endif // FLUKE_FUSED_DIMS_H

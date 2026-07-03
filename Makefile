@@ -56,7 +56,9 @@ ifdef cuda
     CUDART_VER := $(shell grep -E 'define +CUDART_VERSION' $(CUDA_INC)/cuda_runtime_api.h 2>/dev/null | grep -oE '[0-9]+' | head -1)
     ifeq ($(shell [ "$(CUDART_VER)" -ge 12000 ] 2>/dev/null && echo 1),1)
         AOT_OBJ = $(BUILD_DIR)/gemm_i8_rotary_N1536_K512_H8D64R64S2048.o \
-                  $(BUILD_DIR)/gemm_i8_dual_silu_N2048_K512.o
+                  $(BUILD_DIR)/gemm_i8_dual_silu_N2048_K512.o \
+                  $(BUILD_DIR)/factored_lstm_i8_H1024_Khh128_R128.o \
+                  $(BUILD_DIR)/down_proj_i8_R128_K1024.o
     endif
 # make rocm=1 builds the HIP backend (hipcc). Set ROCM_ARCH, e.g.
 #   make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"
