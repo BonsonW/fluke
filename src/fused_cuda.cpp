@@ -313,7 +313,6 @@ struct fluke_flstm_rec {
     int N, T, num_layers, C, K;
     bool use_fused;                        // per-N/device kernel choice (baked at create)
     cudaStream_t cap;                      // private capture/replay stream
-    cudaEvent_t  ev;                       // ordering handshake with the caller's stream
     std::vector<cudaGraphExec_t> graph;    // one per layer, NULL until captured
     void *hh_stage; void *flags;           // fused scratch
     void *hh_down;  void *a_scratch; float *ones;   // two-kernel scratch (ones = scale_a == 1)
@@ -329,7 +328,6 @@ fluke_flstm_rec_t *fluke_flstm_rec_create(const fluke_flstm_backend_t *b, int N,
     // tile (the fused kernel has no M-boundary predication).
     r->use_fused = (N <= b->max_fused_N) && (N % 64 == 0);
     cudaStreamCreateWithFlags(&r->cap, cudaStreamNonBlocking);
-    cudaEventCreateWithFlags(&r->ev, cudaEventDisableTiming);
     r->graph.assign(num_layers > 0 ? num_layers : 1, (cudaGraphExec_t)NULL);
     r->hh_stage = r->flags = r->hh_down = r->a_scratch = NULL; r->ones = NULL;
     if (r->use_fused) {
@@ -351,7 +349,6 @@ void fluke_flstm_rec_free(fluke_flstm_rec_t *r) {
     if (!r) return;
     for (auto g : r->graph) if (g) cudaGraphExecDestroy(g);
     if (r->cap) cudaStreamDestroy(r->cap);
-    if (r->ev)  cudaEventDestroy(r->ev);
     cudaFree(r->hh_stage); cudaFree(r->flags);
     cudaFree(r->hh_down);  cudaFree(r->a_scratch); cudaFree(r->ones);
     delete r;
@@ -367,17 +364,23 @@ int fluke_flstm_recurrence(
 ) {
     if (!r || layer_idx < 0 || layer_idx >= (int)r->graph.size()) return -1;
     const int N = r->N, T = r->T, C = r->C, K = r->K;
-    cudaStream_t cs = r->cap;
-    cudaStream_t user = (cudaStream_t)stream;
+    cudaStream_t cs  = r->cap;              // capture stream (can't capture the default stream)
+    cudaStream_t run = (cudaStream_t)stream; // caller's stream (may be the default stream, handle 0):
+                                             // memset + graph LAUNCH here. Must NOT fall back to cs —
+                                             // if the caller runs on the default stream, launching the
+                                             // graph on cs instead would race the precompute (the bug
+                                             // the per-layer syncs were masking).
 
-    // Order the private stream after the caller's prior work (the x_down precompute).
-    if (user) { cudaEventRecord(r->ev, user); cudaStreamWaitEvent(cs, r->ev, 0); }
-    // Boundary hidden + cell = 0 (eager on cs, before the capture region so replay re-zeros each call).
+    // Boundary hidden + cell = 0 on the caller's stream, right before the graph launch (the graph
+    // re-reads them each replay). Everything runs on `run`, so it is naturally ordered after the
+    // caller's x_down precompute and before the next layer — no event handshake / full-device sync.
     const int boundary = reverse ? T : 0;
-    cudaMemsetAsync((char *)hh_all + (size_t)boundary * N * C, 0, (size_t)N * C, cs);
-    cudaMemsetAsync(cell, 0, (size_t)N * C * sizeof(float), cs);
+    cudaMemsetAsync((char *)hh_all + (size_t)boundary * N * C, 0, (size_t)N * C, run);
+    cudaMemsetAsync(cell, 0, (size_t)N * C * sizeof(float), run);
 
-    // One recurrence step at ring index i; only fluke launches + D2D copies (capture-safe).
+    // One recurrence step at ring index i; only fluke launches + D2D copies (capture-safe). The
+    // launches target `cs` because they run only during capture; the instantiated graph then replays
+    // on whatever stream cudaGraphLaunch is given (`run`).
     auto step = [&](int i) {
         const int t    = reverse ? (T - 1 - i) : i;
         const int prev = reverse ? (t + 1) : t;
@@ -408,9 +411,7 @@ int fluke_flstm_recurrence(
         if (cudaGraphInstantiate(&r->graph[layer_idx], g, 0) != cudaSuccess) return -4;
         cudaGraphDestroy(g);
     }
-    cudaGraphLaunch(r->graph[layer_idx], cs);
-    // Make the caller's stream wait for the recurrence result.
-    if (user) { cudaEventRecord(r->ev, cs); cudaStreamWaitEvent(user, r->ev, 0); }
+    cudaGraphLaunch(r->graph[layer_idx], run);   // replay on the caller's stream (natural ordering)
     return 0;
 }
 

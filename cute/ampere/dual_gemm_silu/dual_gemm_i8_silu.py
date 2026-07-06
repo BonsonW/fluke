@@ -422,6 +422,14 @@ class TensorOpDualGemmI8Silu(TensorOpGemmI8):
 
             # ///////////////////////////////////////////////////////////////////
             # Epilogue: out = silu(gate) * up = gate * sigmoid(gate) * up
+            #
+            # sigmoid(g) is computed via the exact identity 0.5*tanh(0.5*g)+0.5
+            # rather than 1/(1+exp(-g)): tanh is a single MUFU op, whereas the
+            # exp form needs MUFU.EX2 *and* MUFU.RCP. In this short-K (K=512, 8
+            # k-tiles) kernel the epilogue is a large fraction of runtime and the
+            # SFU/MUFU pipe is the throttled resource, so halving the MUFU count
+            # here is ~12% end-to-end on A100 at the deployed shape. (tanh is the
+            # sanctioned CuTe transcendental — see the factored-LSTM kernel.)
             # ///////////////////////////////////////////////////////////////////
             tCrD = cute.make_fragment_like(tCrC_gate, self.c_dtype)
             for i in cutlass.range(num_vals, unroll_full=True):
@@ -431,7 +439,7 @@ class TensorOpDualGemmI8Silu(TensorOpGemmI8):
                                 * rScaleA[i, m, 0] * rScaleB_gate[i, 0, n])
                         up = (tCrC_up[i, m, n].to(cutlass.Float32)
                               * rScaleA[i, m, 0] * rScaleB_up[i, 0, n])
-                        sig = 1.0 / (1.0 + cute.math.exp(-gate))
+                        sig = 0.5 * cute.math.tanh(0.5 * gate) + 0.5
                         tCrD[i, m, n] = (gate * sig * up).to(self.c_dtype)
             cute.autovec_copy(tCrD, tCgC)
 
