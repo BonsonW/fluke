@@ -1,13 +1,14 @@
 # Factored-LSTM Gate Kernel — Optimization & Porting Guide
 
 A hardware-agnostic guide to the int8 factored-LSTM **gate recurrence** kernel
-(`factored_lstm_gate_i8.cu`), how it reaches its current performance, how to reproduce that on
-other GPUs (NVIDIA arches and AMD/HIP), and the traps that cost us time.
+(`sm80_factored_lstm_gate_i8.cu`), how it reaches its current performance, how to reproduce that
+on other GPUs (NVIDIA arches and AMD/HIP), and the traps that cost us time.
 
-**Milestone:** 18.0 µs/step at N=1536, T=2048 on an A100 (sm_80), bit-exact forward + reverse.
-This is the **gate** half of the recurrence; the down-projection is a separate kernel. Closing
-the remaining gap (fusing the two and lifting tensor-core utilisation past the occupancy wall) is
-future work — see *Remaining gap* at the end.
+**Milestone:** **15.64 µs/step** at N=1536, T=2048 on an A100 (sm_80), bit-exact forward + reverse
+(down from 18.0 via the 2D-warp-split reuse balance, optimisation #7 below). This is the **gate**
+half of the recurrence; the down-projection is a separate kernel (see §8). The full down+gate step
+is ~1.2× off the reference kernel (koi). Closing the last bit is *not* an occupancy problem — the
+gate is operand-feed-bound (§7); the remaining gap is a balanced-reuse / fusion problem (§9).
 
 ---
 
@@ -81,6 +82,29 @@ sit on the critical path. Instead:
 1. stage the output tile in shared memory, then write it out as **128-bit** coalesced stores;
 2. when staging, **pack adjacent elements** into the widest store you can (two int8 → one 16-bit
    store here). Per-byte shared stores were, on their own, ~25% of this kernel's runtime.
+
+---
+
+### 2.8 Balance operand-feed reuse with a 2D warp split (the biggest single lever)
+This is what took the gate from 18 → 15.64 µs, and it's the subtle one. The MMA path is **not**
+occupancy-bound — a pure-MMA loop at this kernel's occupancy (8 warps, 1 CTA/SM) reaches ~80%
+tensor utilisation. The gate runs at ~37% because it is **operand-feed-bound**: the tensor cores
+stall waiting for operands (weights and activations) to arrive through the L1TEX/smem pipe. So the
+lever is **reuse** — each loaded fragment should feed as many MMAs as possible.
+
+How the warps tile the CTA controls this. Split the 8 warps in **2D**: `WROW` warps across rows ×
+`WCOL` warps across output channels (`WROW*WCOL = #warps`). Then:
+- each **weight** fragment is reused across `MSET = (rows/CTA / WROW) / 16` row-tiles;
+- each **activation** fragment is reused across `NN = (channels/CTA / WCOL) / 8` channel-tiles.
+
+These trade off: more rows/warp (↑ weight reuse) means fewer channels/warp (↓ activation reuse),
+and vice-versa. Pure row-split (`WROW=all`) over-feeds weights; pure channel-split over-feeds
+activations. The **balanced** point wins. On A100 with BMG=256/HX=64 the optimum is `WROW=4,
+WCOL=2` → weight-reuse 4:1, activation-reuse 16:1 (15.64 µs). Pushing weight-reuse to 8:1
+(`WROW≤2`) starves the activation feed and is *slower*. **Sweep WROW×WCOL per GPU** watching
+register spill (higher reuse needs more resident accumulators). Note: raise reuse via the *warp
+split at a fixed one-wave tile* — raising it via a bigger row-tile (BMG) instead spills registers
+and multi-waves the grid (net loss).
 
 ---
 
@@ -186,38 +210,50 @@ hand-tuned reference that establishes the achievable number and the recipe.
 ---
 
 ## 6. Traps to avoid (fLSTM-specific — we hit these)
-- **Chasing occupancy.** More CTAs/SM (2+) *lowers* performance here: it needs a smaller register
-  budget, which forces dropping the resident cell or spilling — and it floods the read-only cache
-  path with more concurrent weight loads. Once weights are off the shared-memory pipe, **weight
-  reuse at 1 CTA/SM beats higher occupancy.** Don't optimize occupancy for its own sake.
-- **Putting weights in shared memory.** It looks like it should help (load once, reuse) but it
-  saturates the smem/LSU pipe — the exact resource you're trying to protect. Keep weights on the
-  read-only/L2 path.
-- **int4.** Do not use int4 for this recurrence. It halves traffic and doubles TOPS on paper, but
-  the cumulative accuracy loss across the stacked recurrent layers is unacceptable. Stay int8.
+- **The gate is operand-feed-bound, NOT occupancy-bound.** This is the big one, and we believed the
+  opposite for a long time. A pure-MMA loop at this occupancy (8 warps, 1 CTA/SM) reaches ~80%
+  tensor-util, so the tensor cores and occupancy are *not* the wall — the MMAs starve waiting for
+  operands through L1TEX. The fix is *reuse* (§2.8), not more warps. Do NOT chase 2 CTA/SM (it needs
+  a smaller register budget → drops the resident cell / spills, and floods the operand-feed).
+- **Putting weights in shared memory.** Looks like it should help (load once) but ldmatrix-from-smem
+  hits the same L1TEX pipe as `__ldg`; measured net-zero-to-worse. Keep weights on the read-only/L2
+  path; reduce their *load count* via reuse (§2.8) instead.
+- **Repartitioning ≠ less work.** A different warp split changes *who* loads what, not the total
+  load instructions — unless it changes *reuse*. The 2D split (§2.8) helps only because it rebalances
+  reuse, not because it "spreads" the loads.
+- **int4.** Do not use int4 for this recurrence. Halves traffic / doubles TOPS on paper, but the
+  cumulative accuracy loss across the stacked recurrent layers is unacceptable. Stay int8.
 - **Sub-word / scattered stores.** Per-byte `STG`/`STS` are silently expensive. Always stage +
-  coalesce + pack.
-- **Optimizing a pipe that isn't the bound.** Bank-conflict removal here *reduced* a profiler
-  number (L1TEX 65→58%) but did **not** change wall-clock, because the kernel was latency-bound,
-  not L1TEX-throughput-bound. Measure the bound first; a high SOL % can be inflated by conflicts
-  yet still not be the binding constraint.
-- **Cross-step pipelining of the gate.** In a *standalone* gate benchmark the next step's inputs
-  are precomputed, so you can "overlap" steps and get a great-looking number — but it's a mirage:
-  in the real recurrence the next step's input depends on this step's output. Optimize *within*
-  a step; only the down+gate fusion (future) exposes real cross-phase overlap, and even that is
-  bounded by the sequential dependency.
+  coalesce + pack (§2.7). Watch for a *no-op tiling bug*: if a compute loop bound computes to 0
+  (e.g. `rows_per_warp/16` with <16 rows/warp) the kernel silently does nothing and benches
+  fast — **always gate a timing sweep behind a correctness check.**
+- **Optimizing a pipe that isn't the bound.** Bank-conflict removal here *reduced* a profiler number
+  (L1TEX 65→58%) but did **not** move wall-clock at that stage. Measure the bound first.
+- **Cross-step pipelining of the gate (mirage).** In a *standalone* gate bench the next step's inputs
+  are precomputed, so "overlapping" steps looks great — but in the real recurrence the next input
+  depends on this step's output. Optimize *within* a step.
 - **Trusting cold-clock or contended timings.** Warm the GPU, take medians, pin to an idle device.
 
 ---
 
-## 7. Remaining gap (future work)
-At the milestone the gate is ~18 µs and dominated by MMA-pipeline latency at low occupancy
-(1 CTA/SM) — the structural wall. The realistic next levers, none of them "basic":
-- **Fuse the down-projection into the gate** as a single persistent step. The dependency chain
-  (down→gate→h→down) is sequential, so the win is a correct, cheap producer/consumer handoff and a
-  high-utilisation *within-step* pipeline — not cross-step overlap. Needs a real cross-CTA
-  handshake (release/acquire), which on sm_80 costs; sm_90 cluster barriers may help.
-- **Lift tensor-core utilisation past the occupancy wall.** More independent MMAs in flight needs
-  more registers (at the cap) or more warps (a regression here). This is the genuine open problem
-  and likely needs a from-scratch register-blocked mainloop.
-- Establish the AMD number by porting per §5.
+## 7. Full step: gate + down-projection
+The deployable step is two graph-replayed kernels: **down-proj** (`h[t-1] @ W_dn` → `hh_down`) then
+**gate**. The down-proj is a *memory-bound* GEMM (K=1024, tiny N=128; floor ~1.3 µs, it reads all
+of `h` each step). It needs **many CTAs** to saturate DRAM bandwidth (few-CTA versions are
+latency-starved) *and* a cp.async multistage k-pipeline (overlap the `h`-load with the MMAs) to
+approach its floor — a simple full-stage-then-MMA down lands ~2× the deployed number. Treat the
+down-proj as its own optimisation with the same recipe (§2) plus the k-pipeline; the reference DSL
+down runs ~9.7 µs, and the floor says there's room below it.
+
+## 8. Remaining gap (future work)
+Gate is **15.64 µs** (operand-feed-bound; balanced-reuse optimum at WROW=4/WCOL=2). The last bit:
+- **Push reuse toward 8:1 on *both* operands simultaneously.** Our warp-split family balances at 4:1
+  weight / 16:1 activation; the reference reaches ~8:1 on both via a tile geometry we haven't
+  matched (MSET=8 via A-streaming *fits* but starves the activation feed → slower). This is the
+  genuine open register-blocking problem.
+- **Fuse down+gate** to hide the (memory-bound) down behind the (compute-bound) gate — a big win
+  *if* the down is expensive standalone. Two co-resident kernels overlap when the small one fits the
+  large one's spare SMs; the sequential recurrence (down→gate→h→down) means it needs a cross-CTA
+  skewed handoff. A *correct* handshake costs on sm_80; the reference uses an **unsafe timing race**
+  (undefined behavior — do not ship). sm_90 cluster barriers make the safe version cheap.
+- **AMD** number via §5.

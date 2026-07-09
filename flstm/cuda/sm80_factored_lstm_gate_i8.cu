@@ -1,5 +1,5 @@
-// factored_lstm_gate_i8.cu -- int8 factored-LSTM gate recurrence, persistent single-launch.
-// Hand-CUDA reference kernel. 18.0 us/step @ N=1536, T=2048 on A100 (sm80), bit-exact fwd+reverse.
+// sm80_factored_lstm_gate_i8.cu -- int8 factored-LSTM gate recurrence, persistent single-launch.
+// Hand-CUDA reference kernel. 15.64 us/step @ N=1536, T=2048 on A100 (sm80), bit-exact fwd+reverse.
 //
 // See FLSTM_GATE_GUIDE.md for the ground-up optimization rationale, how to reproduce this on
 // other GPUs (including AMD/HIP), the profiling methodology, and the pitfalls to avoid.
@@ -16,21 +16,28 @@
 // THE OPTIMIZATIONS (each independently measured; see guide for the why and the numbers):
 //   1. int8 activation A -> ldmatrix from a small smem tile (efficient smem->register for MMA).
 //   2. gate weights streamed L2->registers via __ldg (read-only / constant-cache path) -- OFF
-//      the shared-memory pipe, NOT resident in smem. Each weight fragment reused across MSET
-//      row-tiles (register blocking); each A fragment reused across all output channels.
+//      the shared-memory pipe, NOT resident in smem.
 //   3. recurrent cell RESIDENT in registers across T (no gmem round-trip); f16 storage.
 //   4. smem A-tile row stride PADDED (KC+16) so the ldmatrix reads are bank-conflict-free.
 //   5. per-channel dequant scale folded with the 1/127 activation scale ONCE (out of the loop).
 //   6. output h staged to smem then written as coalesced 128-bit stores; the staging stores are
 //      packed 16-bit (adjacent columns), never per-byte.
+//   7. ***2D WARP SPLIT (WROW x WCOL) for BALANCED operand reuse -- the key to 15.64us.*** The 8
+//      warps split BOTH rows (WROW) and output channels (WCOL). This is a *reuse-balance* knob:
+//      each weight fragment is reused across MSET=(BMG/WROW)/16 row-tiles, each A fragment across
+//      NN=(HX/WCOL)/8 channel-tiles x 4 gates. The gate is operand-feed-bound (its MMA path can
+//      hit ~80% tensor-util but is starved feeding operands through L1TEX), so raising reuse on
+//      the bound operand is the lever. Pure M-split (WROW=8,WCOL=1) over-feeds weights (18us);
+//      the sweet spot is WROW=4,WCOL=2 -> weight-reuse 4:1, A-reuse 16:1 (15.64us). Pushing
+//      further (WROW=2/1 -> weight 8:1) STARVES the A-feed and is slower -- 4x2 is the optimum.
 //
-// CONFIG (compile-time): GX=16 BMG=256 -> MSET=2, ALDM=1, PIPE=0, CTAPSM=1, CELLREG=1, FP16CELL.
-// This is the tuned A100 config; retune GX/BMG per GPU (guide has the procedure).
+// CONFIG (compile-time): GX=16 BMG=256 WROW=4 WCOL=2, ALDM=1, PIPE=0, CTAPSM=1, CELLREG=1, FP16CELL.
+// This is the tuned A100 config; retune GX/BMG/WROW/WCOL per GPU (guide has the procedure).
 //
 // Build:
 //   nvcc -arch=sm_80 -O3 --use_fast_math -std=c++17 -diag-suppress 177,20013 \
-//     -DGX=16 -DBMG=256 -DALDM=1 -DPIPE=0 -DCTAPSM=1 -DCELLREG=1 -DFP16CELL \
-//     factored_lstm_gate_i8.cu -o flstm_gate
+//     -DGX=16 -DBMG=256 -DWROW=4 -DWCOL=2 -DALDM=1 -DPIPE=0 -DCTAPSM=1 -DCELLREG=1 -DFP16CELL \
+//     sm80_factored_lstm_gate_i8.cu -o flstm_gate
 // Run:  ./flstm_gate --N 1536 --T 2048 [--reverse]    (correctness vs the built-in scalar ref)
 //       ./flstm_gate --N 1536 --T 2048 --bench         (warm timing, median of 9)
 // Profiling probes (see guide, "cost decomposition"):
@@ -75,7 +82,17 @@
 #define CELLREG 1        // 1 = keep recurrent cell resident in registers (no gmem round-trip)
 #endif
 #define HX (H/GX)
-#define MSET ((BMG/16)/WARPS)     // row-tiles per warp
+// 2D warp split: WROW warps across ROWS x WCOL warps across CHANNELS (WROW*WCOL=WARPS=8).
+// Each warp loads only HX/WCOL channels' weights (weight-feed / WCOL) and BMG/WROW rows' A.
+// WROW=8,WCOL=1 == the original M-split. WROW=4,WCOL=2 halves per-warp weight-feed.
+#ifndef WROW
+#define WROW 4
+#endif
+#ifndef WCOL
+#define WCOL 2
+#endif
+#define MSET ((BMG/WROW)/16)      // row-tiles per warp
+#define NN   ((HX/WCOL)/8)        // channel-8-tiles per warp
 #ifndef APAD
 #define APAD 16                   // bytes of smem row padding on the A tile to kill ldmatrix
 #endif                            // bank conflicts: stride (KC+APAD)/4 words must be !=0 mod 32
@@ -135,7 +152,9 @@ __global__ void __launch_bounds__(NTHREADS,CTAPSM) gate_kernel(
   const int gx=blockIdx.x, gy=blockIdx.y;
   const int row0=gy*BMG, hbase=gx*HX;
   const float AS=1.0f/127.0f;
-  const int wr0 = warp*MSET*16;         // this warp's first row within the CTA tile
+  const int wrow=warp%WROW, wcol=warp/WROW;
+  const int wr0 = wrow*(BMG/WROW);      // this warp's first row within the CTA tile
+  const int ch0 = wcol*(HX/WCOL);       // this warp's first channel within HX
 
   extern __shared__ int8_t smem[];
   int8_t* sA = smem;                    // [STAGES_A][BMG][KCS] (padded rows)
@@ -149,9 +168,13 @@ __global__ void __launch_bounds__(NTHREADS,CTAPSM) gate_kernel(
 #if CELLREG
   // recurrent CELL kept RESIDENT in registers across the whole T-loop (each thread owns a
   // fixed set of (row,channel) cells) -> NO cell gmem round-trip (the resident-state lever).
-  float creg[HX/8][MSET][4];
+#ifdef HALFCELL
+  __half creg[NN][MSET][4];   // f16-resident cell (bit-identical; already f16-rounded), frees regs
+#else
+  float creg[NN][MSET][4];
+#endif
   #pragma unroll
-  for(int a=0;a<HX/8;++a) for(int b=0;b<MSET;++b) for(int c=0;c<4;++c) creg[a][b][c]=0.f;
+  for(int a=0;a<NN;++a) for(int b=0;b<MSET;++b) for(int c=0;c<4;++c) creg[a][b][c]=(cellT)0.f;
 #endif
 #if defined(CORE) || defined(NOWRITE)
   int core_sink=0;   // profiling probe sink: keep the probed work live. CORE=MMA-only; NOWRITE=+epi/cell
@@ -204,13 +227,13 @@ __global__ void __launch_bounds__(NTHREADS,CTAPSM) gate_kernel(
 #else
     #pragma unroll 1
 #endif
-    for(int nn=0;nn<HX/8;++nn){
+    for(int nn=0;nn<NN;++nn){
       int cg[MSET][4][4];
       #pragma unroll
       for(int m=0;m<MSET;++m) for(int g=0;g<4;++g) for(int e=0;e<4;++e) cg[m][g][e]=0;
       #pragma unroll
       for(int g=0;g<4;++g){
-        const int8_t* wgs = wg_rp + (long)g*H*KC + (long)(hbase+nn*8+gid)*KC + tg*64; // L2->reg
+        const int8_t* wgs = wg_rp + (long)g*H*KC + (long)(hbase+ch0+nn*8+gid)*KC + tg*64; // L2->reg
         int4 w0=__ldg((const int4*)(wgs)),  w1=__ldg((const int4*)(wgs+16)),
              w2=__ldg((const int4*)(wgs+32)),w3=__ldg((const int4*)(wgs+48));
         int b0[8]={w0.x,w0.z,w1.x,w1.z,w2.x,w2.z,w3.x,w3.z};
@@ -234,7 +257,7 @@ __global__ void __launch_bounds__(NTHREADS,CTAPSM) gate_kernel(
         int8_t hh[4];
         #pragma unroll
         for(int e=0;e<4;++e){
-          int lcol=nn*8+2*tg+(e&1), rin=(e<2)?gid:gid+8;
+          int lcol=ch0+nn*8+2*tg+(e&1), rin=(e<2)?gid:gid+8;   // ch0: this warp's channel offset
           int oc=hbase+lcol, gr=row0+mrow0+rin;
 #if CELLREG
           float cv=creg[nn][m][e];
@@ -254,7 +277,7 @@ __global__ void __launch_bounds__(NTHREADS,CTAPSM) gate_kernel(
         core_sink += (int)hh[0]+hh[1]+hh[2]+hh[3];   // sink h: keep epi/cell live, skip writeout
 #else
         // PACKED staging: e0,e1 -> row gid (adjacent cols); e2,e3 -> row gid+8. 32 STS.U16 vs 64 STS.U8.
-        int col0=nn*8+2*tg;
+        int col0=ch0+nn*8+2*tg;
         *(uint16_t*)&sHo[(size_t)(mrow0+gid  )*HXP + col0] = (uint16_t)((uint8_t)hh[0] | ((uint8_t)hh[1]<<8));
         *(uint16_t*)&sHo[(size_t)(mrow0+gid+8)*HXP + col0] = (uint16_t)((uint8_t)hh[2] | ((uint8_t)hh[3]<<8));
 #endif
