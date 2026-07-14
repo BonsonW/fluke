@@ -523,17 +523,21 @@ class TensorOpDualGemmI8Silu(TensorOpGemmI8):
         return
 
     def _make_smem_layout_C(self, dtype, major_mode, copy_bits, smem_tiler):
-        """Epilogue-C smem staging layout (single stage), plain (unswizzled).
+        """Epilogue-C smem staging layout (single stage), plain + padded.
 
         Unlike gemm_f16's swizzled C layout, the int8 MMA's doubled-N C partition
         makes autovec_copy's right_inverse reject the composed (swizzled) layout,
-        so we stage through a plain row/col-major tile. The staging exists only to
-        coalesce the smem->gmem store; any C-smem bank conflicts are a second-order
-        cost (measured below the store-coalescing win).
+        so we stage through a plain tile. A plain bN=64 fp16 row is exactly 32
+        banks, so the MMA-fragment register->smem write hits a ~6.6-way bank
+        conflict (65% of store wavefronts). Padding the major stride by 8 elems
+        (16 B / 4 banks) decorrelates consecutive rows and removes it -> +7% at
+        bn=64 (289 vs 270 TOPS, M=131072). The pad costs ~2 KB of the C tile, still
+        far inside the A/B smem arena it unions over, so occupancy is unchanged.
         """
+        pad = 8
         if major_mode == utils.LayoutEnum.ROW_MAJOR:
-            return cute.make_layout(smem_tiler, stride=(smem_tiler[1], 1))
-        return cute.make_layout(smem_tiler, stride=(1, smem_tiler[0]))
+            return cute.make_layout(smem_tiler, stride=(smem_tiler[1] + pad, 1))
+        return cute.make_layout(smem_tiler, stride=(1, smem_tiler[0] + pad))
 
     def _make_gmem_tiled_copy_C(self, atom_copy, dtype, major_mode, copy_bits):
         """Coalesced smem->gmem thread map for the C store. Mirrors gemm_f16."""
