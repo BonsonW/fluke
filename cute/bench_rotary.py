@@ -26,10 +26,16 @@ import common
 # A100 reference peaks (adjust for other GPUs).
 PEAK_TOPS = 624.0
 PEAK_BW_GBS = 2000.0
-# Matches the shipped/exported rotary config (export_gemm_i8_rotary.py): atom (2,4,1)
-# with bN=256. (2,2,1) + bN=256 over-allocates accumulator registers and spills.
-ATOM_LAYOUT, NUM_STAGES, USE_K32 = (2, 4, 1), 3, True
-BM, BN, BK = 128, 256, 64   # BN must be a multiple of head_dim
+# Matches the shipped/exported rotary config (export_gemm_i8_rotary.py): atom (2,2,1)
+# with bN=128. Paired with the coalesced smem-staged store, this narrow atom beats the
+# old (2,4,1)+bN=256 by ~15% at M>=16k (242 vs 210 TOPS): half the threads/block spawn
+# ~2x more, smaller CTAs that balance better across the 108 SMs and raise SM-pipe
+# utilization. bN=128 keeps the rotary companion column (sincos_width away) in-register
+# under this atom (cols_per_mma_n = atom_N*16 = 32 divides sincos_width=32). Do NOT use
+# (2,2,1)+bN=256: it over-allocates accumulator registers and spills. See bench numbers
+# in the coalesced-store profiling round.
+ATOM_LAYOUT, NUM_STAGES, USE_K32 = (2, 2, 1), 3, True
+BM, BN, BK = 128, 128, 64   # BN must be a multiple of head_dim
 
 
 def build(kern, d):

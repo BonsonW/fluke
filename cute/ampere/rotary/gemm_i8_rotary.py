@@ -83,9 +83,19 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
             mB.element_type, self.b_major_mode, ab_copy_bits,
             (self.cta_tiler[1], self.cta_tiler[2], self.num_stages),
         )
-        smem_size = (
+        # Epilogue-C staging layout (single stage, plain+padded). The rotary result
+        # is written to smem in the scattered MMA-C fragment layout, then re-read
+        # with a coalesced thread map for 128-bit global stores.
+        sC_layout = self._make_smem_layout_C(
+            mC.element_type, self.c_major_mode, ab_copy_bits,
+            (self.cta_tiler[0], self.cta_tiler[1]),
+        )
+        # A/B smem is reused for C in the epilogue, so the block only needs the
+        # larger of the two — the C staging costs no extra footprint (occupancy).
+        smem_size = max(
             cute.size_in_bytes(mA.element_type, sA_layout)
-            + cute.size_in_bytes(mB.element_type, sB_layout)
+            + cute.size_in_bytes(mB.element_type, sB_layout),
+            cute.size_in_bytes(mC.element_type, sC_layout),
         )
 
         atom_async_copy = cute.make_copy_atom(
@@ -96,6 +106,12 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
             atom_async_copy, mA.element_type, self.a_major_mode, ab_copy_bits)
         tiled_copy_B = self._make_gmem_tiled_copy_AB(
             atom_async_copy, mB.element_type, self.b_major_mode, ab_copy_bits)
+        # Synchronous 128-bit universal copy for the coalesced smem->gmem store.
+        atom_sync_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mC.element_type, num_bits_per_copy=128,
+        )
+        tiled_copy_C = self._make_gmem_tiled_copy_C(
+            atom_sync_copy, mC.element_type, self.c_major_mode, 128)
 
         op = cute.nvgpu.warp.MmaI8Op(
             self.a_dtype, self.b_dtype, self.acc_dtype, self.mma_inst_shape)
@@ -124,8 +140,8 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
 
         self.kernel(
             mA, mB, mC, mScaleA, mScaleB, mSin, mCos,
-            sA_layout, sB_layout,
-            tiled_copy_A, tiled_copy_B, tiled_mma, raster_factor, seqlen,
+            sA_layout, sB_layout, sC_layout,
+            tiled_copy_A, tiled_copy_B, tiled_copy_C, tiled_mma, raster_factor, seqlen,
         ).launch(
             grid=rasterization_remap_grid_dim,
             block=[self.num_threads, 1, 1],
@@ -144,8 +160,10 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
         mCos: cute.Tensor,
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
+        sC_layout: cute.Layout,
         tiled_copy_A: cute.TiledCopy,
         tiled_copy_B: cute.TiledCopy,
+        tiled_copy_C: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         rasterization_factor: cutlass.Int32,
         seqlen: cutlass.Int32,
@@ -184,12 +202,34 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
             cA = cute.domain_offset((0, residual_k, 0), cA)
             cB = cute.domain_offset((0, residual_k, 0), cB)
 
+            # A/B/C share one smem arena: the epilogue overwrites the A/B tiles
+            # with the fp16 C staging tile (union), so no extra footprint is requested.
+            @cute.struct
+            class SharedStorageAB:
+                a: cute.struct.Align[
+                    cute.struct.MemRange[mA.element_type, cute.cosize(sA_layout)], 16]
+                b: cute.struct.Align[
+                    cute.struct.MemRange[mB.element_type, cute.cosize(sB_layout)], 16]
+
+            @cute.struct
+            class SharedStorageC:
+                c: cute.struct.Align[
+                    cute.struct.MemRange[mC.element_type, cute.cosize(sC_layout)], 16]
+
             smem = cutlass.utils.SmemAllocator()
-            sA = smem.allocate_tensor(mA.element_type, sA_layout, 16)
-            sB = smem.allocate_tensor(mB.element_type, sB_layout, 16)
+            storage = smem.allocate(
+                max(SharedStorageAB.size_in_bytes(), SharedStorageC.size_in_bytes()),
+                byte_alignment=16,
+            )
+            sA = SharedStorageAB(storage).a.get_tensor(sA_layout)
+            sB = SharedStorageAB(storage).b.get_tensor(sB_layout)
+            sC = SharedStorageC(storage).c.get_tensor(sC_layout)
 
             thr_copy_A = tiled_copy_A.get_slice(tidx)
             thr_copy_B = tiled_copy_B.get_slice(tidx)
+            thr_copy_C = tiled_copy_C.get_slice(tidx)
+            tCsC_epilogue = thr_copy_C.partition_S(sC)
+            tCgC_epilogue = thr_copy_C.partition_D(gC)
             tAgA = thr_copy_A.partition_S(gA)
             tAsA = thr_copy_A.partition_D(sA)
             tBgB = thr_copy_B.partition_S(gB)
@@ -247,6 +287,7 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
             tCsA = thr_mma.partition_A(sA)
             tCsB = thr_mma.partition_B(sB)
             tCgC = thr_mma.partition_C(gC)
+            tCsC = thr_mma.partition_C(sC)
             tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
             tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
             tCrC = tiled_mma.make_fragment_C(tCgC)
@@ -392,9 +433,78 @@ class TensorOpGemmI8Rotary(TensorOpGemmI8):
                         do_rot_f = qk_f * inrot_f
                         out_v = do_rot_f * rotated + (1.0 - do_rot_f) * self_v
                         tCrD[i, m, n] = out_v.to(self.c_dtype)
-            cute.autovec_copy(tCrD, tCgC)
+
+            # Stage the fp16 result through smem to convert the scattered MMA-C
+            # fragment layout (the N-doubled permutation stores 8-column-strided
+            # values per thread) into contiguous 128-bit global stores. The direct
+            # register->gmem write (autovec_copy tCrD->tCgC) only fills 16 of every
+            # 32 store bytes per sector; going via smem coalesces the store.
+            cute.autovec_copy(tCrD, tCsC)
+            cute.arch.sync_threads()
+            tCrC_epilogue = cute.make_fragment_like(tCsC_epilogue)
+            cute.autovec_copy(tCsC_epilogue, tCrC_epilogue)
+
+            # Predicate the store on the M/N extents (tiles may overhang the matrix).
+            cCstore = cute.local_tile(
+                cute.make_identity_tensor(mC.layout.shape)[None, None, bidz],
+                tiler=self.cta_tiler, coord=tiler_coord, proj=(1, 1, None),
+            )
+            tCcCstore = thr_copy_C.partition_S(cCstore)
+            tCpC = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (tCgC_epilogue.shape[0][1], cute.size(tCgC_epilogue, mode=[1]),
+                     cute.size(tCgC_epilogue, mode=[2])),
+                    stride=(cute.size(tCgC_epilogue, mode=[1]), 1, 0),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in range(tCpC.shape[0]):
+                for m in range(tCpC.shape[1]):
+                    tCpC[rest_v, m, 0] = cute.elem_less(
+                        tCcCstore[(0, rest_v), m, 0][0], mC.shape[0]
+                    )
+            for rest_v in range(tCpC.shape[0]):
+                for n in range(tCpC.shape[2]):
+                    if cute.elem_less(tCcCstore[(0, rest_v), 0, n][1], mC.shape[1]):
+                        cute.copy(tiled_copy_C, tCrC_epilogue[None, None, n],
+                                  tCgC_epilogue[None, None, n], pred=tCpC[None, None, n])
 
         return
+
+    def _make_smem_layout_C(self, dtype, major_mode, copy_bits, smem_tiler):
+        """Epilogue-C smem staging layout (single stage), plain + padded.
+
+        The int8 MMA's doubled-N C partition makes autovec_copy's right_inverse
+        reject a composed (swizzled) layout, so we stage through a plain tile. A
+        plain fp16 row whose width is a multiple of 32 banks makes the MMA-fragment
+        register->smem write hit a heavy bank conflict; padding the major stride by
+        8 elems (16 B / 4 banks) decorrelates consecutive rows and removes it. The
+        pad costs a couple KB of the C tile, still inside the A/B smem arena it
+        unions over, so occupancy is unchanged. (Ported from dual_gemm_i8_silu.)
+        """
+        pad = 8
+        if major_mode == utils.LayoutEnum.ROW_MAJOR:
+            return cute.make_layout(smem_tiler, stride=(smem_tiler[1] + pad, 1))
+        return cute.make_layout(smem_tiler, stride=(1, smem_tiler[0] + pad))
+
+    def _make_gmem_tiled_copy_C(self, atom_copy, dtype, major_mode, copy_bits):
+        """Coalesced smem->gmem thread map for the C store. Mirrors gemm_f16."""
+        copy_elems = copy_bits // dtype.width
+        shape_dim_1 = cute.size(self.bN) // copy_elems
+        thread_layout = cute.make_layout(
+            (self.num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+        )
+        if major_mode != utils.LayoutEnum.ROW_MAJOR:
+            shape_dim_0 = cute.size(self.bM) // copy_elems
+            thread_layout = cute.make_layout(
+                (shape_dim_0, self.num_threads // shape_dim_0), stride=(1, shape_dim_0)
+            )
+        value_layout = (
+            cute.make_layout((1, copy_elems))
+            if major_mode == utils.LayoutEnum.ROW_MAJOR
+            else cute.make_layout((copy_elems, 1))
+        )
+        return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
 
 
 # =============================================================================
@@ -409,13 +519,13 @@ def export_gemm_i8_rotary(
     b_dtype: Type[cutlass.Numeric] = cutlass.Int8,
     c_dtype: Type[cutlass.Numeric] = cutlass.Float16,
     acc_dtype: Type[cutlass.Numeric] = cutlass.Int32,
-    atom_layout_mnk: Tuple[int, int, int] = (2, 4, 1),
+    atom_layout_mnk: Tuple[int, int, int] = (2, 2, 1),
     file_path: str = "./artifacts",
     file_name: str = "gemm_i8_rotary",
     function_prefix: str = "gemm_i8_rotary",
     use_k32: bool = True,
     bm: int = 128,
-    bn: int = 256,
+    bn: int = 128,
     num_stages: int = 3,
     m_size: int = 128,
     k_size: int = 128,

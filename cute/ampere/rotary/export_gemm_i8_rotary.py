@@ -26,10 +26,15 @@ CONFIGS = [
 ]
 
 # Tiling / scheduling knobs for the exported kernel.
+# atom (2,2,1) + bN=128 (not the old (2,4,1)+bN=256): paired with the coalesced
+# smem-staged epilogue store it is ~15% faster at M>=16k (242 vs 210 TOPS on A100)
+# — the narrower atom launches ~2x more, smaller CTAs that balance better across the
+# SMs. bN=128 keeps the rotary companion column in-register (cols_per_mma_n =
+# atom_N*16 = 32 divides sincos_width=32). (2,2,1)+bN=256 spills; do not use it.
 BM = 128
-BN = 256              # N tile (must be a multiple of head_dim)
+BN = 128              # N tile (must be a multiple of head_dim)
 NUM_STAGES = 3
-ATOM_LAYOUT = (2, 4, 1)
+ATOM_LAYOUT = (2, 2, 1)
 
 # Exported .h/.o live in the top-level artifacts/<arch>/ dir (bundled into libfluke.a per
 # arch). Ampere compiles to sm80 cubins (also run on sm86/sm89). _HERE = cute/ampere/rotary.
