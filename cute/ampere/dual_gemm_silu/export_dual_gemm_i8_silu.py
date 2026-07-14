@@ -24,10 +24,15 @@ CONFIGS = [
     dict(M=256, N=2048, K=512),
 ]
 
-# Tiling / scheduling knobs. Dual accumulator (gate + up) doubles register pressure,
-# so bN is small (32 wins at K=512); constraint: bN >= atom_N * mmaN * 2.
+# Tiling / scheduling knobs. Dual accumulator (gate + up) doubles register pressure.
+# bN=64 with the NARROW atom (2,2,1) wins at production scale (large M): it halves the
+# A/weight L2 re-reads (kernel is L2-traffic bound), reaching ~46% of peak vs ~38% at
+# bN=32 — ~+10% at M>=2048, and it stacks with the coalesced+padded smem-staged epilogue.
+# bN=32 only wins for M<=1024 (decode); production is M~1M. Constraint: bN >= atom_N*mmaN*2
+# (=64 for atom_N=2 with the N-doubled permutation). Do NOT pair bN=64 with atom (2,4,1) —
+# the wide atom loses (~30% of peak). See autotune_dual.py / the round-129 profiling.
 BM = 128
-BN = 32
+BN = 64
 NUM_STAGES = 3
 ATOM_LAYOUT = (2, 2, 1)
 
