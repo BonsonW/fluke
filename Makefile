@@ -82,10 +82,24 @@ else ifdef rocm
 	# by gcnArchName in fused_hip.cpp. Baked shapes match the CUDA int8 kernels.
 	ROTARY_HSACO = rdna_fp8_gemm_rotary_N1536_K512_TM64_TN256.hsaco
 	MLP_HSACO    = rdna_fp8_dual_gemm_silu_N2048_K512_TM32_TN256.hsaco
-	AOT_OBJ = $(BUILD_DIR)/embed_rotary_gfx1200.o $(BUILD_DIR)/embed_rotary_gfx1201.o \
+	# Per-arch fused-fp8 wrapper TUs (fp8_arch_<arch>.o, one launch vtable each) + the embedded
+	# HSACO images they load. Adding a chip = add its fp8_arch_<arch>.o + embed_*_<arch>.o here,
+	# its src/fp8_arch_<arch>.cpp, and a g_archs[] row in fused_hip.cpp.
+	AOT_OBJ = $(BUILD_DIR)/fp8_arch_gfx1200.o    $(BUILD_DIR)/fp8_arch_gfx1201.o \
+	          $(BUILD_DIR)/embed_rotary_gfx1200.o $(BUILD_DIR)/embed_rotary_gfx1201.o \
 	          $(BUILD_DIR)/embed_mlp_gfx1200.o    $(BUILD_DIR)/embed_mlp_gfx1201.o
 else
 	GPU_LIB = $(BUILD_DIR)/cpu_decoy.a
+endif
+
+# make no_fused=1 skips the fused DSL kernels: compiles fused_{cuda,hip}.o to their
+# null-backend stubs (fluke_*_select returns NULL, callers keep fp16) and drops every AOT
+# artifact object. Lets a real cuda=1/rocm=1 build succeed with NO exported artifacts —
+# use it when the target GPU isn't a supported fused arch (e.g. RDNA3 gfx1100, where the
+# fp8 kernels are RDNA4-only) or you just don't need the fused path.
+ifdef no_fused
+	CPPFLAGS += -DFLUKE_NO_FUSED
+	AOT_OBJ =
 endif
 
 ifdef debug
@@ -181,6 +195,22 @@ $(BUILD_DIR)/hip_code.a: $(ROCM_OBJ)
 
 $(BUILD_DIR)/nn_hip.o: src/nn_hip.c | $(BUILD_DIR)
 	$(HIPCC) -x hip $(ROCM_CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -fPIC -c $< -o $@
+
+# Per-arch fused-fp8 wrapper object: ONE source (src/fp8_arch.cpp) compiled once per arch, with
+# the arch tag + that arch's generated headers passed as -D. Exports the fluke_fp8_ops_<arch>
+# vtable (bound by gcnArchName in fused_hip.cpp). Pure HOST code — it only drives the HIP
+# module/launch API (no __global__ kernels of its own) — so compile it host-only with -x c++
+# (+ the ROCm headers, which -x c++ drops from hipcc). Compiling it as HIP would run a device
+# pass that can't resolve the host functions the externally-linked vtable points at. Host-only
+# also means it builds without the target GPU present. The generated headers are the real
+# prerequisites (make fails clearly if the arch wasn't exported yet).
+$(BUILD_DIR)/fp8_arch_%.o: src/fp8_arch.cpp src/fp8_ops.h \
+                           artifacts/%/$(ROTARY_HSACO:.hsaco=.h) artifacts/%/$(MLP_HSACO:.hsaco=.h) | $(BUILD_DIR)
+	$(HIPCC) -x c++ $(CXXFLAGS) $(CPPFLAGS) -I . -I $(ROCM_ROOT)/include -D__HIP_PLATFORM_AMD__ \
+	    -DFLUKE_FP8_ARCH_NAME=$* \
+	    -DFLUKE_FP8_ROTARY_HDR='"artifacts/$*/$(ROTARY_HSACO:.hsaco=.h)"' \
+	    -DFLUKE_FP8_MLP_HDR='"artifacts/$*/$(MLP_HSACO:.hsaco=.h)"' \
+	    $(DEPFLAGS) -c $< -o $@
 
 # Embed a per-arch HSACO image into an object exposing arch-qualified symbols
 # fluke_fp8_<role>_<gfxNNNN>{,_end} (fused_hip.cpp loads them via hipModuleLoadData). Symbols are

@@ -20,7 +20,7 @@
 #include <cuda_runtime.h>  // defines CUDART_VERSION
 #endif
 
-#if defined(HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+#if defined(HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && !defined(FLUKE_NO_FUSED)
 
 #include "artifacts/sm80/gemm_i8_rotary_N1536_K512_H8D64R64S2048.h"
 #include "artifacts/sm80/gemm_i8_dual_silu_N2048_K512.h"
