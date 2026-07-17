@@ -23,11 +23,9 @@ FUSED_OBJ =
 AOT_OBJ =
 SHARED_LINK = $(CC) -shared
 
-# fused_hip.o = HIP host dispatch for the fp8 ABI. Built with hipcc on a rocm build (real
-# backend), else with the host C++ compiler (compiles to the null-backend stub). Overridden
-# in the rocm branch below.
-FUSED_HIP_CC = $(CXX)
-FUSED_HIP_CFLAGS = $(CXXFLAGS) $(CPPFLAGS) -I .
+# The fused dispatch + per-arch launch TUs (fused_{cuda,hip}.c, {i8,fp8}_arch.c) are pure C host
+# code — no device kernels of their own — so they build with $(CC). The rocm branch adds the HIP
+# headers to CPPFLAGS (below) so fused_hip.c / fp8_arch.c find <hip/hip_runtime.h>.
 
 # make asan=1 enables address sanitiser
 ifdef asan
@@ -53,18 +51,26 @@ ifdef cuda
     # fused_cuda.o is always built (null-backend stub on older CUDA), so downstream still links.
     # fused_hip.o compiles to the fp8 null-backend stub here (HAVE_ROCM undefined).
     FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o $(BUILD_DIR)/fused_hip.o
+    # Generated INT8 header names (one per fused kernel; they bake the model dims). Passed to
+    # i8_arch.c as -D so the single per-arch source (compiled once per sm) resolves them from
+    # artifacts/<sm>/. (The factored-LSTM fused path was removed — transformer kernels only.)
+    I8_ROTARY_HDR   = gemm_i8_rotary_N1536_K512_H8D64R64S2048.h
+    I8_MLP_HDR      = gemm_i8_dual_silu_N2048_K512.h
     CUDART_VER := $(shell grep -E 'define +CUDART_VERSION' $(CUDA_INC)/cuda_runtime_api.h 2>/dev/null | grep -oE '[0-9]+' | head -1)
     ifeq ($(shell [ "$(CUDART_VER)" -ge 12000 ] 2>/dev/null && echo 1),1)
-        AOT_OBJ = $(BUILD_DIR)/gemm_i8_rotary_N1536_K512_H8D64R64S2048.o \
-                  $(BUILD_DIR)/gemm_i8_dual_silu_N2048_K512.o \
-                  $(BUILD_DIR)/factored_lstm_i8_H1024_Khh128_R128.o \
-                  $(BUILD_DIR)/down_proj_i8_R128_K1024.o
+        # Per-arch launch vtable (i8_arch_<sm>.o, one per SM arch) + the CuTe-exported kernel objects
+        # (symbol-rewritten below). Adding an SM arch = add its i8_arch_<sm>.o + kernel .o's here,
+        # and a g_archs[] row in fused_cuda.c.
+        AOT_OBJ = $(BUILD_DIR)/i8_arch_sm80.o \
+                  $(BUILD_DIR)/gemm_i8_rotary_N1536_K512_H8D64R64S2048.o \
+                  $(BUILD_DIR)/gemm_i8_dual_silu_N2048_K512.o
     endif
 # make rocm=1 builds the HIP backend (hipcc). Set ROCM_ARCH, e.g.
 #   make rocm=1 ROCM_ARCH="--offload-arch=gfx1200"
 else ifdef rocm
 	ROCM_ROOT ?= /opt/rocm
 	ROCM_LIB ?= $(ROCM_ROOT)/lib
+	ROCM_INC ?= $(ROCM_ROOT)/include
 	HIPCC ?= $(ROCM_ROOT)/bin/hipcc
 	ROCM_CFLAGS += -g -Wall $(ROCM_ARCH)
 	ROCM_OBJ += $(BUILD_DIR)/nn_hip.o
@@ -72,19 +78,18 @@ else ifdef rocm
 	GPU_OBJ = $(ROCM_OBJ)
 	SHARED_LINK = $(HIPCC) -shared $(ROCM_ARCH)
 	ROCM_LDFLAGS = -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
-	CPPFLAGS += -DHAVE_ROCM=1
+	# HIP headers for the pure-C host dispatch (fused_hip.c / fp8_arch.c compiled with $(CC)).
+	CPPFLAGS += -DHAVE_ROCM=1 -I $(ROCM_INC) -D__HIP_PLATFORM_AMD__
 	# fp8 fused dispatch (fused_hip.o, real backend) + fused_cuda.o (int8 null stub here).
 	FUSED_OBJ = $(BUILD_DIR)/fused_cuda.o $(BUILD_DIR)/fused_hip.o
-	FUSED_HIP_CC = $(HIPCC)
-	FUSED_HIP_CFLAGS = $(ROCM_CFLAGS) $(CPPFLAGS) -I . -fPIC
 	# AOT fp8 kernels: one HSACO per concrete RDNA4 arch (gfx12-generic won't compile through
 	# FlyDSL's MLIR and per-chip objects don't cross-load), embedded into libfluke.a and loaded
-	# by gcnArchName in fused_hip.cpp. Baked shapes match the CUDA int8 kernels.
+	# by gcnArchName in fused_hip.c. Baked shapes match the CUDA int8 kernels.
 	ROTARY_HSACO = rdna_fp8_gemm_rotary_N1536_K512_TM64_TN256.hsaco
 	MLP_HSACO    = rdna_fp8_dual_gemm_silu_N2048_K512_TM32_TN256.hsaco
-	# Per-arch fused-fp8 wrapper TUs (fp8_arch_<arch>.o, one launch vtable each) + the embedded
-	# HSACO images they load. Adding a chip = add its fp8_arch_<arch>.o + embed_*_<arch>.o here,
-	# its src/fp8_arch_<arch>.cpp, and a g_archs[] row in fused_hip.cpp.
+	# Per-arch fused-fp8 wrapper objects (fp8_arch_<arch>.o, one launch vtable each) + the embedded
+	# HSACO images they load. Adding a chip = add its fp8_arch_<arch>.o + embed_*_<arch>.o here
+	# and a g_archs[] row in fused_hip.c (one source, src/fp8_arch.c, compiled once per arch).
 	AOT_OBJ = $(BUILD_DIR)/fp8_arch_gfx1200.o    $(BUILD_DIR)/fp8_arch_gfx1201.o \
 	          $(BUILD_DIR)/embed_rotary_gfx1200.o $(BUILD_DIR)/embed_rotary_gfx1201.o \
 	          $(BUILD_DIR)/embed_mlp_gfx1200.o    $(BUILD_DIR)/embed_mlp_gfx1201.o
@@ -108,20 +113,10 @@ ifdef debug
 	CFLAGS += -fopenmp
 endif
 
-.PHONY: all shared fp8_shared clean distclean test-flstm-graph
+.PHONY: all shared fp8_shared clean distclean
 
 all: $(STATICLIB)
 shared: $(SHAREDLIB)
-
-# CUDA-graph capture-safety regression for the int8 factored-LSTM kernels: builds a C++ driver
-# against libfluke.a and requires bit-identical output eager vs captured-and-replayed. CUDA only
-# (uses cudaGraph + the sm80 int8 backend). Run:
-#   make cuda=1 CUDA_ARCH="-gencode arch=compute_80,code=sm_80" test-flstm-graph
-$(BUILD_DIR)/test_flstm_graph_gpu: test/test_flstm_graph_gpu.cu $(STATICLIB) | $(BUILD_DIR)
-	$(NVCC) -O2 -std=c++17 $(CUDA_ARCH) -DHAVE_CUDA=1 -I include $< $(STATICLIB) \
-	    -L$(CUDA_LIB) -lcudart -lcuda -o $@
-test-flstm-graph: $(BUILD_DIR)/test_flstm_graph_gpu
-	$(BUILD_DIR)/test_flstm_graph_gpu
 
 # fp8 fused ABI as a standalone .so for the ctypes-based fly/ tests (rocm=1 only). Bundles the
 # fp8 dispatch + the embedded per-arch HSACOs; loaded by fly/test_*.py to exercise the real
@@ -151,15 +146,28 @@ $(BUILD_DIR)/error.o: src/error.c include/fluke/fluke_error.h | $(BUILD_DIR)
 $(BUILD_DIR)/nn_cpu.o: src/nn_cpu.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# Fused-int8 dispatch (host C++; includes the generated artifacts/<arch>/*.h). -I . lets the
-# `#include "artifacts/sm80/..."` resolve. Self-guards on CUDART>=12 (else null-backend stub).
-$(BUILD_DIR)/fused_cuda.o: src/fused_cuda.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -I . $(DEPFLAGS) -c $< -o $@
+# Fused-int8 dispatch (pure C; arch-neutral — no artifact includes). Self-guards on CUDART>=12
+# (else null-backend stub). The per-arch launch code lives in i8_arch.c below.
+$(BUILD_DIR)/fused_cuda.o: src/fused_cuda.c src/i8_ops.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I . $(DEPFLAGS) -c $< -o $@
 
-# Fused-fp8 dispatch (host HIP; includes artifacts/<gfxNNNN>/*.h). Built with hipcc on rocm
-# (real backend) or the host C++ compiler elsewhere (fp8 null-backend stub; HAVE_ROCM undefined).
-$(BUILD_DIR)/fused_hip.o: src/fused_hip.cpp | $(BUILD_DIR)
-	$(FUSED_HIP_CC) $(FUSED_HIP_CFLAGS) $(DEPFLAGS) -c $< -o $@
+# Per-arch fused-int8 launch vtable: ONE source (src/i8_arch.c) compiled once per SM arch, with the
+# arch tag + that arch's generated headers passed as -D. Exports fluke_i8_ops_<sm> (bound by compute
+# capability in fused_cuda.c). Pure C host code (the device kernels are the linked-in CuTe .o's);
+# -I . resolves the artifacts/<sm>/*.h includes. The headers are the real prerequisites (make fails
+# clearly if the arch wasn't exported yet).
+$(BUILD_DIR)/i8_arch_%.o: src/i8_arch.c src/i8_ops.h \
+                          artifacts/%/$(I8_ROTARY_HDR) artifacts/%/$(I8_MLP_HDR) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I . \
+	    -DFLUKE_I8_ARCH_NAME=$* \
+	    -DFLUKE_I8_ROTARY_HDR='"artifacts/$*/$(I8_ROTARY_HDR)"' \
+	    -DFLUKE_I8_MLP_HDR='"artifacts/$*/$(I8_MLP_HDR)"' \
+	    $(DEPFLAGS) -c $< -o $@
+
+# Fused-fp8 dispatch (pure C; arch-neutral — no artifact includes). Real backend on rocm (CPPFLAGS
+# carries the HIP headers), fp8 null-backend stub elsewhere (HAVE_ROCM undefined).
+$(BUILD_DIR)/fused_hip.o: src/fused_hip.c src/fp8_ops.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I . $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -197,24 +205,22 @@ $(BUILD_DIR)/hip_code.a: $(ROCM_OBJ)
 $(BUILD_DIR)/nn_hip.o: src/nn_hip.c | $(BUILD_DIR)
 	$(HIPCC) -x hip $(ROCM_CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -fPIC -c $< -o $@
 
-# Per-arch fused-fp8 wrapper object: ONE source (src/fp8_arch.cpp) compiled once per arch, with
-# the arch tag + that arch's generated headers passed as -D. Exports the fluke_fp8_ops_<arch>
-# vtable (bound by gcnArchName in fused_hip.cpp). Pure HOST code — it only drives the HIP
-# module/launch API (no __global__ kernels of its own) — so compile it host-only with -x c++
-# (+ the ROCm headers, which -x c++ drops from hipcc). Compiling it as HIP would run a device
-# pass that can't resolve the host functions the externally-linked vtable points at. Host-only
-# also means it builds without the target GPU present. The generated headers are the real
-# prerequisites (make fails clearly if the arch wasn't exported yet).
-$(BUILD_DIR)/fp8_arch_%.o: src/fp8_arch.cpp src/fp8_ops.h \
+# Per-arch fused-fp8 wrapper object: ONE source (src/fp8_arch.c) compiled once per arch, with the
+# arch tag + that arch's generated headers passed as -D. Exports the fluke_fp8_ops_<arch> vtable
+# (bound by gcnArchName in fused_hip.c). Pure C host code — it only drives the HIP module/launch
+# API (no __global__ kernels of its own) — so it builds with $(CC) (CPPFLAGS carries the HIP
+# headers). Builds without the target GPU present. The generated headers are the real prerequisites
+# (make fails clearly if the arch wasn't exported yet).
+$(BUILD_DIR)/fp8_arch_%.o: src/fp8_arch.c src/fp8_ops.h \
                            artifacts/%/$(ROTARY_HSACO:.hsaco=.h) artifacts/%/$(MLP_HSACO:.hsaco=.h) | $(BUILD_DIR)
-	$(HIPCC) -x c++ $(CXXFLAGS) $(CPPFLAGS) -I . -I $(ROCM_ROOT)/include -D__HIP_PLATFORM_AMD__ \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I . \
 	    -DFLUKE_FP8_ARCH_NAME=$* \
 	    -DFLUKE_FP8_ROTARY_HDR='"artifacts/$*/$(ROTARY_HSACO:.hsaco=.h)"' \
 	    -DFLUKE_FP8_MLP_HDR='"artifacts/$*/$(MLP_HSACO:.hsaco=.h)"' \
 	    $(DEPFLAGS) -c $< -o $@
 
 # Embed a per-arch HSACO image into an object exposing arch-qualified symbols
-# fluke_fp8_<role>_<gfxNNNN>{,_end} (fused_hip.cpp loads them via hipModuleLoadData). Symbols are
+# fluke_fp8_<role>_<gfxNNNN>{,_end} (fused_hip.c loads them via hipModuleLoadData). Symbols are
 # arch-qualified so gfx1200/gfx1201 images don't collide at link. Self-contained: no runtime file.
 # The stem (%) is the gfx arch. Fails with a clear message if the artifact wasn't exported yet.
 $(BUILD_DIR)/embed_rotary_%.o: artifacts/%/$(ROTARY_HSACO) | $(BUILD_DIR)

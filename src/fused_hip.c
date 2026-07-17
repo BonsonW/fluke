@@ -1,55 +1,56 @@
 // Fused FP8 DSL kernels (AMD/HIP) — arch dispatch only.
 //
-// The AMD counterpart of src/fused_cuda.cpp. Implements the ATen-free C ABI declared in
+// The AMD counterpart of src/fused_cuda.c. Implements the ATen-free C ABI declared in
 // <fluke/fluke.h> (fluke_fp8_select, fluke_qkv_rotary_fp8_gpu, fluke_gated_mlp_fp8_gpu).
 //
 // This TU holds NO arch-specific launch code. Each supported arch compiles to its own
-// src/fp8_arch_<arch>.cpp, which includes that arch's generated header (baking its launch
-// geometry) and exports a `fluke_fp8_ops_<arch>` vtable (see src/fp8_ops.h). Here we just
-// match the device's gcnArchName to a row in g_archs[], load that arch's embedded HSACO
-// images through its vtable, and dispatch launches through it. Because the per-arch launch
-// code is isolated, one libfluke.a can embed many arches (a "fat" binary) even when their
-// launch configs differ (RDNA4 WMMA/wave32 vs CDNA3 MFMA/wave64).
+// src/fp8_arch.c, which includes that arch's generated header (baking its launch geometry) and
+// exports a `fluke_fp8_ops_<arch>` vtable (see src/fp8_ops.h). Here we match the device's
+// gcnArchName to a row in g_archs[], load that arch's embedded HSACO images through its vtable,
+// and dispatch launches through it. Because the per-arch launch code is isolated, one libfluke.a
+// can embed many arches (a "fat" binary) even when their launch configs differ (RDNA4 WMMA/wave32
+// vs CDNA3 MFMA/wave64).
 //
-// The FlyDSL artifacts are standalone HSACO images; the Makefile embeds the per-arch bytes
-// into libfluke.a (objcopy/.incbin -> fluke_fp8_<role>_<arch> symbols) and they are loaded
-// at runtime with hipModuleLoadData, so the archive stays self-contained (no runtime file).
+// The FlyDSL artifacts are standalone HSACO images; the Makefile embeds the per-arch bytes into
+// libfluke.a (objcopy/.incbin -> fluke_fp8_<role>_<arch> symbols) and they are loaded at runtime
+// with hipModuleLoadData, so the archive stays self-contained (no runtime file).
 //
-// On a device whose arch is not embedded (or a dims mismatch) fluke_fp8_select returns NULL
-// and the caller keeps its fp16 path.
+// On a device whose arch is not embedded (or a dims mismatch) fluke_fp8_select returns NULL and
+// the caller keeps its fp16 path.
 
 #include <fluke/fluke.h>
 
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 
 #if defined(HAVE_ROCM) && !defined(FLUKE_NO_FUSED)
 
 #include <hip/hip_runtime.h>
 
 #include "fp8_ops.h"
-// Baked model dims (shared with the CUDA backend — model-specific, not arch-specific).
+/* Baked model dims (shared with the CUDA backend — model-specific, not arch-specific). */
 #include "fused_dims.h"
 
-// Per-arch vtables (defined in src/fp8_arch_<arch>.cpp).
+/* Per-arch vtables (defined in src/fp8_arch.c). */
 extern const struct fluke_fp8_ops fluke_fp8_ops_gfx1200;
 extern const struct fluke_fp8_ops fluke_fp8_ops_gfx1201;
 
-// Embedded per-arch HSACO images (Makefile: objcopy/.incbin -> these symbols).
-extern "C" const unsigned char fluke_fp8_rotary_gfx1200[];
-extern "C" const unsigned char fluke_fp8_rotary_gfx1201[];
-extern "C" const unsigned char fluke_fp8_mlp_gfx1200[];
-extern "C" const unsigned char fluke_fp8_mlp_gfx1201[];
+/* Embedded per-arch HSACO images (Makefile: objcopy/.incbin -> these symbols). */
+extern const unsigned char fluke_fp8_rotary_gfx1200[];
+extern const unsigned char fluke_fp8_rotary_gfx1201[];
+extern const unsigned char fluke_fp8_mlp_gfx1200[];
+extern const unsigned char fluke_fp8_mlp_gfx1201[];
 
 struct arch_row {
-    const char               *arch;    // gcnArchName base (before the ':feature' suffix)
-    const struct fluke_fp8_ops *ops;   // that arch's launch vtable
-    const void               *rotary;  // embedded qkv-rotary HSACO
-    const void               *mlp;     // embedded dual-gemm+silu HSACO
+    const char                 *arch;    /* gcnArchName base (before the ':feature' suffix) */
+    const struct fluke_fp8_ops *ops;     /* that arch's launch vtable */
+    const void                 *rotary;  /* embedded qkv-rotary HSACO */
+    const void                 *mlp;     /* embedded dual-gemm+silu HSACO */
 };
 
-// One row per embedded arch. Add a chip = new fp8_arch_<arch>.cpp (+ its embed symbols +
-// Makefile rule) and a row here; fluke_fp8_select matches by gcnArchName.
+/* One row per embedded arch. Add a chip = new fp8_arch.c compile for it (+ its embed symbols +
+   Makefile rule) and a row here; fluke_fp8_select matches by gcnArchName. */
 static const struct arch_row g_archs[] = {
     { "gfx1200", &fluke_fp8_ops_gfx1200, fluke_fp8_rotary_gfx1200, fluke_fp8_mlp_gfx1200 },
     { "gfx1201", &fluke_fp8_ops_gfx1201, fluke_fp8_rotary_gfx1201, fluke_fp8_mlp_gfx1201 },
@@ -57,25 +58,29 @@ static const struct arch_row g_archs[] = {
 
 struct fluke_fp8_backend {
     fluke_dims_t dims;
-    const struct fluke_fp8_ops *ops;  // selected arch's launch vtable
+    const struct fluke_fp8_ops *ops;  /* selected arch's launch vtable */
 };
 
 static int g_modules_loaded = 0;
 
 fluke_fp8_backend_t *fluke_fp8_select(int device_index, fluke_dims_t dims) {
     hipDeviceProp_t prop;
+    char arch[64];
+    char *colon;
+    const struct arch_row *sel = NULL;
+    size_t i;
+    static struct fluke_fp8_backend b;  /* process-lifetime; all layers share it */
+
     if (hipGetDeviceProperties(&prop, device_index) != hipSuccess) {
         return NULL;
     }
-    // gcnArchName is e.g. "gfx1201:sramecc+:xnack-"; match on the base gfx name.
-    char arch[64];
+    /* gcnArchName is e.g. "gfx1201:sramecc+:xnack-"; match on the base gfx name. */
     strncpy(arch, prop.gcnArchName, sizeof(arch) - 1);
     arch[sizeof(arch) - 1] = '\0';
-    char *colon = strchr(arch, ':');
+    colon = strchr(arch, ':');
     if (colon) *colon = '\0';
 
-    const struct arch_row *sel = NULL;
-    for (size_t i = 0; i < sizeof(g_archs) / sizeof(g_archs[0]); ++i) {
+    for (i = 0; i < sizeof(g_archs) / sizeof(g_archs[0]); ++i) {
         if (strcmp(g_archs[i].arch, arch) == 0) { sel = &g_archs[i]; break; }
     }
     if (!sel) {
@@ -96,7 +101,6 @@ fluke_fp8_backend_t *fluke_fp8_select(int device_index, fluke_dims_t dims) {
         fprintf(stderr, "[fluke] fp8 kernel backend active on device %d (%s)\n", device_index, arch);
     }
 
-    static struct fluke_fp8_backend b;  // process-lifetime; all layers share it
     b.dims = dims;
     b.ops  = sel->ops;
     return &b;
@@ -121,7 +125,7 @@ int fluke_gated_mlp_fp8_gpu(
     return b->ops->gated_mlp(out, a_fp8, gate_fp8, up_fp8, scale_a, scale_gate, scale_up, M);
 }
 
-#else  // no ROCm — null backend; callers keep the fp16 path.
+#else  /* no ROCm — null backend; callers keep the fp16 path. */
 
 fluke_fp8_backend_t *fluke_fp8_select(int device_index, fluke_dims_t dims) {
     (void)device_index; (void)dims;
