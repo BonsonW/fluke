@@ -269,46 +269,24 @@ int fluke_flstm_step_i8_gpu(
     void *c_f32, int B, void *stream
 );
 
-// Single-launch fused factored-LSTM step: does the recurrent int8 hh down-projection AND
-// the gate step in ONE kernel (removes the inter-kernel launch/DRAM round-trip; ~1.3-1.6x
-// over the down_proj + step pair on A100). Replaces fluke_down_proj_i8_gpu (hh) +
-// fluke_flstm_step_i8_gpu for the per-step recurrence only (the ih precompute still uses
-// fluke_down_proj_i8_gpu).
-//   h_prev_i8 [B, H] int8 (fixed 1/127); w_dn_i8 [K_hh, H] int8 recurrent down-weight;
-//   comb_scale [K_hh] f32 = per-channel w_dn scale * (1/127), host-folded;
-//   x_f16 [B, R] f16 = this step's x_down slice;
-//   Bi/Bf/Bg/Bo f16 [H, Kc], bias_{i,f,g,o} f32 [H]; c_f32 [B, H] updated in place;
-//   h_i8 [B, H] int8 out (1/127); hh_stage f16 [B, K_hh] scratch (producer-written, no init);
-//   flags int32 [ceil(B/64)*4] zeroed at allocation (self-cleaning across steps).
-// RESIDENCY: the whole grid must be co-resident (consumers spin on same-grid producers).
-// At the baked tile config that means B <= 512; the caller MUST fall back to the two-kernel
-// path for larger B. Returns 0 on success. stream as above (CUDA-graph capturable).
-int fluke_flstm_fused_step_i8_gpu(
-    const fluke_flstm_backend_t *b, void *h_i8,
-    const void *h_prev_i8, const void *w_dn_i8, const void *comb_scale, const void *x_f16,
-    const void *Bi, const void *Bf, const void *Bg, const void *Bo,
-    const void *bias_i, const void *bias_f, const void *bias_g, const void *bias_o,
-    void *c_f32, void *hh_stage, void *flags, int B, void *stream
-);
-
 // ── Unified factored-LSTM recurrence (fluke owns the loop + CUDA graph) ──────────────────────────
 // One call runs a whole layer's T-step recurrence over the ring and abstracts EVERYTHING the caller
-// would otherwise branch on: fused-vs-two-kernel choice (device- and N-dependent), the hh|x concat,
-// all per-step scratch, and CUDA-graph capture/replay. The caller (slorado) keeps no fused/graph/
-// device code — it just provides the ring buffers, the precomputed x_down, and the layer weights.
+// would otherwise branch on: the per-step down_proj + hh|x concat + gate step, all per-step scratch,
+// and CUDA-graph capture/replay. The caller (slorado) keeps no graph/device code — it just provides
+// the ring buffers, the precomputed x_down, and the layer weights.
 // A HIP backend implements the same ABI over hipGraph, so callers stay portable.
 //
 // Opaque per-(backend, N, T) recurrence state: device scratch + one captured graph per layer.
 typedef struct fluke_flstm_rec fluke_flstm_rec_t;
 
-// Create/free the recurrence state. Allocates scratch sized for N (fused: hh_stage+flags; two-kernel:
-// hh_down+a_scratch+ones), a private capture stream + ordering event, and num_layers graph slots.
+// Create/free the recurrence state. Allocates the two-kernel scratch (hh_down + a_scratch + ones),
+// a private capture stream, and num_layers graph slots.
 // Returns NULL if the backend is unavailable. Must be freed with fluke_flstm_rec_free.
 fluke_flstm_rec_t *fluke_flstm_rec_create(const fluke_flstm_backend_t *b, int N, int T, int num_layers);
 void fluke_flstm_rec_free(fluke_flstm_rec_t *rec);
 
 // Run layer `layer_idx`'s full T-step recurrence: zero the boundary hidden + cell, then loop t,
-// choosing fused or down_proj+cat+step internally. Captures a CUDA graph on the first call for this
+// running down_proj + cat + gate step internally. Captures a CUDA graph on the first call for this
 // layer and replays it thereafter. Ordered w.r.t. `stream` via an internal event (the x_down
 // precompute on `stream` is visible before the graph runs; results are visible to `stream` after).
 //   hh_all   [T+1, N, C] int8 ring (scale 1/127); boundary slot (reverse?T:0) is zeroed here
