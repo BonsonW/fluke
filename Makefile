@@ -92,12 +92,13 @@ else
 	GPU_LIB = $(BUILD_DIR)/cpu_decoy.a
 endif
 
-# make no_fused=1 skips the fused DSL kernels: compiles fused_{cuda,hip}.o to their
-# null-backend stubs (fluke_*_select returns NULL, callers keep fp16) and drops every AOT
-# artifact object. Lets a real cuda=1/rocm=1 build succeed with NO exported artifacts —
-# use it when the target GPU isn't a supported fused arch (e.g. RDNA3 gfx1100, where the
-# fp8 kernels are RDNA4-only) or you just don't need the fused path.
-ifdef no_fused
+# The fused DSL kernels (int8 CUDA / fp8 HIP) are OPT-IN. They need AOT artifacts exported
+# per target arch (see README), which aren't portable — so by default we compile
+# fused_{cuda,hip}.o to their null-backend stubs (fluke_*_select returns NULL, callers keep
+# fp16) and link no artifact objects. This lets `make cuda=1` / `make rocm=1` succeed out of
+# the box (and on archs with no fused backend at all, e.g. RDNA3 gfx1100). Pass fused=1 once
+# you've exported the artifacts for the target arch to link the real fused kernels.
+ifneq ($(fused),1)
 	CPPFLAGS += -DFLUKE_NO_FUSED
 	AOT_OBJ =
 endif
