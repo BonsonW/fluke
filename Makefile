@@ -150,10 +150,12 @@ $(BUILD_DIR)/fused_hip.o: src/fused_hip.cpp | $(BUILD_DIR)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# cpu decoy (no GPU backend selected)
+# cpu decoy (no GPU backend selected). BSD/macOS ar cannot create an archive with
+# no members, so write the archive magic directly -- both GNU and BSD ar accept this
+# as a valid empty archive
 $(BUILD_DIR)/cpu_decoy.a: | $(BUILD_DIR)
 	rm -f $@
-	$(AR) -r $@
+	printf '!<arch>\n' > $@
 
 # cuda
 $(BUILD_DIR)/cuda.a: $(CUDA_OBJ)
